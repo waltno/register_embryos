@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "register-embryos"
+version = "0.1.0"
+description = "ND2 -> nucleus table -> registered atlas workflow for multiplexed HCR embryo images"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Nolan Walter", email = "waltno@uw.edu" }]
+keywords = ["HCR", "microscopy", "nd2", "cellpose", "segmentation", "ICP", "registration", "zebrafish"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+  "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = [
+  "numpy>=1.23",
+  "pandas>=1.5",
+  "scipy>=1.9",
+  "matplotlib>=3.6",
+  "scikit-image>=0.20",
+  "nd2reader>=3.3",
+  "cellpose>=3.0",
+  "plotly>=5.15",
+  "typer>=0.9",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+widgets = ["ipywidgets>=8.0", "ipython>=8.0"]
+open3d = ["open3d>=0.17"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0"]
+all = ["ipywidgets>=8.0", "ipython>=8.0", "open3d>=0.17", "pytest>=7.0"]
+
+[project.scripts]
+register-embryos = "register_embryos.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/waltno/register_embryos"
+Issues = "https://github.com/waltno/register_embryos/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/register_embryos"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
