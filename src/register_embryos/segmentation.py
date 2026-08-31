@@ -34,7 +34,12 @@ import numpy as np
 from .imaging import EmbryoVolume, VoxelSize
 
 __all__ = [
+    "available_cpus",
     "cellpose_major_version",
+    "DEFAULT_NUCLEUS_DIAMETER_UM",
+    "nucleus_z_span_bins",
+    "require_unbinned_for_3d",
+    "report_3d_memory",
     "SegmentedEmbryo",
     "segment_2d",
     "segment_3d",
@@ -79,6 +84,21 @@ class SegmentedEmbryo:
     @property
     def is_3d(self) -> bool:
         return self.mode == "3d"
+
+
+def available_cpus() -> int:
+    """CPUs this process may actually use.
+
+    ``os.cpu_count()`` reports the machine's cores, not the process's allowance.
+    Inside a cgroup-limited session or a scheduler slot those differ wildly -- a
+    2-core allocation on a 192-core node -- and dividing the machine count among
+    workers then sets each PyTorch worker to ~96 threads on 2 cores, so they spend
+    their time contending instead of computing.
+    """
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:  # pragma: no cover - not Linux
+        return max(1, os.cpu_count() or 1)
 
 
 def cellpose_major_version() -> int:
@@ -261,6 +281,68 @@ def segment_3d(
     return masks
 
 
+#: Rough nucleus diameter for the cohorts this package was built for.  Used only
+#: for the informational z-span report; override per call.
+DEFAULT_NUCLEUS_DIAMETER_UM = 6.0
+
+
+def nucleus_z_span_bins(
+    binned_z_um: float, nucleus_diameter_um: float = DEFAULT_NUCLEUS_DIAMETER_UM
+) -> float:
+    """How many z-planes a typical nucleus spans at this z spacing."""
+    return float(nucleus_diameter_um) / float(binned_z_um) if binned_z_um else float("inf")
+
+
+def require_unbinned_for_3d(
+    bin_size: int,
+    z_um: float,
+    label: str = "",
+    nucleus_diameter_um: float = DEFAULT_NUCLEUS_DIAMETER_UM,
+    allow_binned: bool = False,
+) -> None:
+    """Refuse 3D segmentation on a z-binned volume.
+
+    3D segmentation takes the **whole z-stack**, unbinned.  z-binning is a
+    concession made for 2D segmentation: it max-projects several planes into one
+    so each plane has enough signal to segment independently.  That is exactly the
+    information 3D needs -- feeding it binned data both destroys the z resolution
+    it works from and leaves a nucleus thinner than a single plane, so there is
+    nothing to link across z and ``do_3D`` reduces to a slow 2D run.
+
+    With a 1.5 um z-step and a ~6 um nucleus, an unbinned stack gives a nucleus a
+    4-plane span; at the 2D-tuned ``bin_size=7`` it is 0.57 planes.
+
+    Raises:
+        ValueError: unless ``bin_size == 1`` or ``allow_binned=True``.
+    """
+    if bin_size == 1:
+        return
+
+    span = nucleus_z_span_bins(z_um * bin_size, nucleus_diameter_um)
+    message = (
+        f"{label or 'volume'}: 3D segmentation needs the unbinned z-stack, but this "
+        f"volume was loaded with bin_size={bin_size} ({z_um * bin_size:.2f} um per "
+        f"plane, so a ~{nucleus_diameter_um:g} um nucleus spans only {span:.2f} "
+        f"planes). Reload with load(bin_size=1) for mode='3d', or use mode='2d' / "
+        f"'2d+link' with the binned volume. Pass allow_binned=True to override."
+    )
+    if allow_binned:
+        print(f"  [WARN] {message}")
+        return
+    raise ValueError(message)
+
+
+def report_3d_memory(volume_shape: Tuple[int, int, int], n_channels: int = 1) -> None:
+    """State the footprint of an unbinned 3D run, which is the usual failure mode."""
+    z, y, x = volume_shape
+    per_channel_gb = z * y * x * 4 / 1e9          # float32
+    print(
+        f"  [MEM]  unbinned volume {z}x{y}x{x}: {per_channel_gb:.2f} GB per channel "
+        f"as float32 ({per_channel_gb * n_channels:.2f} GB for {n_channels} channels). "
+        f"Cellpose needs several multiples of this; keep max_workers=1 for 3D."
+    )
+
+
 def _label_z_spans(masks: np.ndarray) -> np.ndarray:
     """Number of z-bins each label occupies -- a sanity check on anisotropy.
 
@@ -329,6 +411,8 @@ def segment_embryo(
     anisotropy: Optional[float] = None,
     output_dir: Optional[str | Path] = None,
     save_masks: bool = True,
+    nucleus_diameter_um: float = DEFAULT_NUCLEUS_DIAMETER_UM,
+    allow_binned: bool = False,
     verbose: bool = True,
     **kwargs,
 ) -> SegmentedEmbryo:
@@ -339,6 +423,11 @@ def segment_embryo(
         anisotropy: override the value derived from ND2 metadata.  Only used in
             3D mode.
         output_dir: masks and a gene-map sidecar are written here.
+        nucleus_diameter_um: physical nucleus size, used only in the message when
+            3D is refused on a binned volume.  Unrelated to ``diameter``, which is
+            in xy pixels.
+        allow_binned: permit ``mode="3d"`` on a z-binned volume.  Off by default:
+            3D wants the whole stack, and binned 3D is a slow 2D run.
     """
     if nuclei_channel not in volume.binned_channels:
         raise ValueError(
@@ -361,6 +450,15 @@ def segment_embryo(
             iou_threshold=iou_threshold,
         )
     elif mode == "3d":
+        require_unbinned_for_3d(
+            bin_size=volume.bin_size,
+            z_um=volume.voxel.z_um,
+            label=volume.embryo_id,
+            nucleus_diameter_um=nucleus_diameter_um,
+            allow_binned=allow_binned,
+        )
+        if verbose:
+            report_3d_memory(nuclei_volume.shape, n_channels=len(volume.binned_channels))
         masks = segment_3d(
             nuclei_volume,
             anisotropy=resolved_anisotropy,
@@ -416,6 +514,8 @@ def segment_cohort(
     gpu: bool = False,
     diameter: Optional[float] = None,
     anisotropy: Optional[float] = None,
+    nucleus_diameter_um: float = DEFAULT_NUCLEUS_DIAMETER_UM,
+    allow_binned: bool = False,
     max_workers: int = 1,
     verbose: bool = True,
     **kwargs,
@@ -436,7 +536,7 @@ def segment_cohort(
             f"memory is per-worker; reduce workers if this runs out of memory."
         )
     if n_threads > 1:
-        per_worker = max(1, (os.cpu_count() or 1) // n_threads)
+        per_worker = max(1, available_cpus() // n_threads)
         try:
             import torch
 
@@ -453,6 +553,8 @@ def segment_cohort(
             gpu=gpu,
             diameter=diameter,
             anisotropy=anisotropy,
+            nucleus_diameter_um=nucleus_diameter_um,
+            allow_binned=allow_binned,
             output_dir=output_root / volume.embryo_id if output_root else None,
             verbose=verbose,
             **kwargs,

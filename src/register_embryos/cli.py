@@ -98,7 +98,11 @@ def run(
     ),
     run_all: bool = typer.Option(False, "--all", help="Run every cohort in the directory."),
     timepoint: Optional[str] = typer.Option(None, "--timepoint", "-t"),
-    bin_size: int = typer.Option(7, "--bin-size", "-b", help="Z-slices per bin (max projection)."),
+    bin_size: Optional[int] = typer.Option(
+        None, "--bin-size", "-b",
+        help="Z-planes per bin (max projection). Default: 7 for 2D, 1 for 3D "
+             "(3D takes the whole stack unbinned).",
+    ),
     mode: str = typer.Option(
         "2d", "--mode", "-m",
         help="Segmentation: '2d' (per z-bin), '3d' (Cellpose do_3D), '2d+link' (2D then IoU link).",
@@ -145,6 +149,10 @@ def run(
 
     Rotation and contrast come from JSON written by the notebook widget; when
     absent, no rotation is applied and contrast falls back to percentiles.
+
+    --mode 3d loads the z-stack unbinned (bin_size=1), because binning is a
+    concession for 2D segmentation and destroys the z information 3D works from.
+    It is much heavier: use a GPU (see docs/qsub_gpu_segmentation.sh).
     """
     from .workflow import run_all_cohorts, run_cohort
 

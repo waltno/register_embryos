@@ -484,3 +484,103 @@ def test_atlas_rejects_a_table_without_registered_coords():
     df = pd.DataFrame({"embryo_id": ["a"], "x": [0.0], "y": [0.0], "z": [0.0]})
     with pytest.raises(ValueError, match="needs columns"):
         build_atlas(df, reference_embryo_id="a", verbose=False)
+
+
+# ---------------------------------------------------------------------------
+# Automatic contrast on a realistic HCR intensity distribution
+# ---------------------------------------------------------------------------
+
+def _hcr_like_channel(seed=0, shape=(8, 160, 160)):
+    """A channel with the intensity profile real HCR data actually has.
+
+    Fitted to a real 20x dorsal wt1a channel after normalisation:
+
+        percentile   p50      p90      p99.5    p99.9    max
+        real         0.0037   0.0253   0.0984   0.1765   1.000
+        this         0.0037   0.0173   0.0845   0.1899   1.000
+
+    The *shape* is the point, not just the range: a long dim lognormal shoulder
+    that is all background, plus a very sparse bright tail (0.05% of pixels) that
+    is the actual signal.  On a tight, narrow background any percentile pair looks
+    fine -- it is this dim shoulder that makes a low percentile of 1 disastrous,
+    because p1 then sits at the very bottom of the background rather than above it.
+    """
+    rng = np.random.default_rng(seed)
+    n = int(np.prod(shape))
+    values = rng.lognormal(mean=np.log(0.0037), sigma=1.2, size=n)   # background
+    bright = rng.choice(n, size=max(1, int(0.0005 * n)), replace=False)
+    values[bright] = rng.uniform(0.3, 1.0, bright.size)              # sparse puncta
+    return np.clip(values, 0, 1).astype(np.float32).reshape(shape)
+
+
+def test_the_hcr_fixture_matches_the_real_intensity_profile():
+    """Guard the fixture itself: if it drifts, the contrast tests stop meaning anything."""
+    channel = _hcr_like_channel()
+    assert np.percentile(channel, 50) == pytest.approx(0.0037, rel=0.35)
+    assert np.percentile(channel, 90) == pytest.approx(0.025, rel=0.45)
+    assert np.percentile(channel, 99.5) == pytest.approx(0.098, rel=0.45)
+    assert channel.max() > 0.9
+
+
+def _volume_with(channels):
+    from register_embryos.imaging import EmbryoVolume, VoxelSize
+    from register_embryos.naming import parse_embryo_name
+
+    return EmbryoVolume(
+        name=parse_embryo_name("20260410_1.5_wt_12s_dorsal_20X_hand2_tbx1_wt1a.nd2"),
+        binned_channels=channels,
+        voxel=VoxelSize(0.863, 1.5), bin_size=7,
+        c_size=len(channels), z_size=42,
+    )
+
+
+def test_a_low_percentile_of_one_stretches_background_into_signal():
+    """Why the default is p90, not p1.
+
+    On real data p1/p99.5 put 36-41% of pixels above the 0.05 threshold, so every
+    nucleus read as expressing. The dim shoulder is background, not signal.
+    """
+    channel = _hcr_like_channel()
+    volume = _volume_with({0: channel, 1: channel})
+
+    naive = auto_contrast_limits(
+        [volume], low_percentile=1.0, high_percentile=99.5, verbose=False
+    )
+    sensible = auto_contrast_limits([volume], verbose=False)   # p90 / p99.9
+
+    naive_positive = (apply_contrast(channel, naive.get(volume.embryo_id, 1)) > 0.05).mean()
+    good_positive = (apply_contrast(channel, sensible.get(volume.embryo_id, 1)) > 0.05).mean()
+
+    # On real data this pair gave 36-41%; the fixture reproduces ~44%.
+    assert naive_positive > 0.30          # background swept wholesale into signal
+    assert good_positive < 0.15           # a plausible HCR positive fraction
+    assert good_positive < naive_positive / 3
+
+
+def test_auto_contrast_warns_when_almost_everything_reads_positive(capsys):
+    channel = _hcr_like_channel()
+    volume = _volume_with({0: channel, 1: channel})
+    auto_contrast_limits(
+        [volume], low_percentile=1.0, high_percentile=99.5, verbose=True
+    )
+    out = capsys.readouterr().out
+    assert "background stretched into signal" in out
+    assert "raise low_percentile" in out
+
+
+def test_auto_contrast_does_not_warn_about_the_nuclear_channel(capsys):
+    """DAPI is broadly positive by design, so a high fraction there is not a fault."""
+    channel = _hcr_like_channel()
+    volume = _volume_with({0: channel})        # channel 0 only
+    auto_contrast_limits(
+        [volume], low_percentile=1.0, high_percentile=99.5, verbose=True
+    )
+    assert "background stretched into signal" not in capsys.readouterr().out
+
+
+def test_auto_contrast_reports_the_positive_fraction(capsys):
+    volume = _volume_with({0: _hcr_like_channel(), 1: _hcr_like_channel(seed=1)})
+    auto_contrast_limits([volume], verbose=True)
+    out = capsys.readouterr().out
+    assert "ch0=(" in out and "ch1=(" in out
+    assert "+]" in out                         # the [NN%+] diagnostic

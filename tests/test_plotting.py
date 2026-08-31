@@ -111,3 +111,80 @@ def test_plotting_prefers_registered_coordinates(cloud, tmp_path):
     # The x axis label comes from the coordinate column that was used.
     assert "x" in fig.axes[0].get_xlabel()
     assert fig.axes[0].get_xlim()[1] > 50
+
+
+# ---------------------------------------------------------------------------
+# Indexing: style arrays are positional, dataframe labels are not
+# ---------------------------------------------------------------------------
+
+def _concatenated_cohort():
+    """Two embryos concatenated then sliced, so labels do NOT start at 0.
+
+    This is the shape every real call has -- `registered[registered.embryo_id == eid]`
+    off a concatenated table -- and it is what broke label-based indexing.
+    """
+    rng = np.random.default_rng(1)
+    frames = []
+    for name in ("e0", "e1"):
+        df = pd.DataFrame(rng.normal(0, 10, (120, 3)), columns=["x", "y", "z"])
+        df["embryo_id"] = name
+        df["hand2"] = np.where(df["x"] > 0, 0.7, 0.0)
+        df["wt1a"] = np.where(df["y"] > 0, 0.6, 0.0)
+        frames.append(df)
+    return pd.concat(frames, ignore_index=True)
+
+
+def test_additive_2d_handles_a_non_zero_based_index(tmp_path):
+    """Regression: the second embryo's slice has labels 120..239, not 0..119."""
+    cohort = _concatenated_cohort()
+    slice_ = cohort[cohort["embryo_id"] == "e1"]
+    assert slice_.index[0] != 0        # the condition that triggered the bug
+
+    path = tmp_path / "sliced.png"
+    plot_additive_2d(slice_, mode="dark", save_path=path)
+    assert path.exists() and path.stat().st_size > 0
+
+
+def test_additive_2d_handles_labelled_rows_from_slices(tmp_path):
+    """The per-embryo-row form used by CohortWorkflow.plot_all()."""
+    cohort = _concatenated_cohort()
+    rows = [(eid, cohort[cohort["embryo_id"] == eid]) for eid in ("e0", "e1")]
+    path = tmp_path / "rows.png"
+    plot_additive_2d(rows, mode="light", save_path=path)
+    assert path.exists()
+
+
+def test_additive_2d_survives_a_duplicated_index(tmp_path):
+    """A concatenation without ignore_index repeats labels; .loc would fan out."""
+    cohort = _concatenated_cohort()
+    duplicated = pd.concat([cohort.iloc[:50], cohort.iloc[:50]])
+    assert duplicated.index.duplicated().any()
+    path = tmp_path / "dup.png"
+    plot_additive_2d(duplicated, mode="dark", save_path=path)
+    assert path.exists()
+
+
+def test_gene_panels_2d_handles_a_non_zero_based_index(tmp_path):
+    cohort = _concatenated_cohort()
+    slice_ = cohort[cohort["embryo_id"] == "e1"]
+    path = tmp_path / "genes_sliced.png"
+    plot_gene_panels_2d(slice_, mode="light", save_path=path)
+    assert path.exists()
+
+
+def test_colours_stay_matched_to_their_rows_after_slicing():
+    """The real risk of label/positional mixing: right plot, wrong colours.
+
+    Every hand2-positive row must get the hand2 hue, whatever the index labels.
+    """
+    from register_embryos.plotting import GENE_RGB, additive_style
+
+    cohort = _concatenated_cohort()
+    slice_ = cohort[cohort["embryo_id"] == "e1"].copy()
+    style = additive_style(slice_, genes=["hand2"], mode="dark", threshold=0.05)
+
+    positive = (slice_["hand2"].to_numpy() >= 0.05)
+    assert positive.any() and (~positive).any()
+    # Positional alignment: mask[i] must describe row i of the slice.
+    assert np.allclose(style["rgb"][positive][0], GENE_RGB["hand2"])
+    assert style["hi_mask"].tolist() == positive.tolist()

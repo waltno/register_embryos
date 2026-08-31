@@ -146,11 +146,19 @@ out/wt_12s_dorsal_20X/
 
 ## Segmentation modes
 
-| mode | what it does | when |
-|---|---|---|
-| `2d` | Cellpose on each z-bin independently | fast, robust; labels are per-slice so one nucleus spanning two bins becomes two rows |
-| `3d` | one Cellpose pass with `do_3D=True` and the voxel anisotropy | labels consistent through z, so a nucleus is one row with a true 3D centroid — the right input for ICP |
-| `2d+link` | 2D Cellpose, then link slices by mask IoU | middle ground; removes duplicate centroids without the cost of 3D flow |
+| mode | z input | what it does | when |
+|---|---|---|---|
+| `2d` | binned (`bin_size=7`) | Cellpose on each z-bin independently | fast, robust; labels are per-slice so one nucleus spanning two bins becomes two rows |
+| `3d` | **unbinned** (`bin_size=1`) | one Cellpose pass with `do_3D=True` and the voxel anisotropy | labels consistent through z, so a nucleus is one row with a true 3D centroid — the right input for ICP |
+| `2d+link` | binned | 2D Cellpose, then link slices by mask IoU | middle ground; removes duplicate centroids without the cost of 3D flow |
+
+**3D takes the whole z-stack, unbinned — this is enforced, not advisory.** z-binning
+is a concession made for 2D: it max-projects several planes into one so each plane
+carries enough signal to segment alone. That is exactly the information 3D works
+from. At the 2D-tuned `bin_size=7` (1.5 µm z-step → 10.5 µm per plane) a ~6 µm
+nucleus spans 0.57 planes, so there is nothing to link across z and `do_3D`
+degenerates into a slow 2D run. `segment(mode="3d")` refuses a binned volume;
+`bin_size` defaults per mode, so `--mode 3d` loads unbinned automatically.
 
 Two separate knobs, often confused:
 
@@ -177,6 +185,17 @@ excluded from the mean instead. In 3D mode assignment distances are in
 micrometres, so an anisotropic stack does not preferentially assign along z, and
 `max_assign_distance_um` stops a pixel being dragged across the embryo.
 
+**Why automatic contrast uses the 90th percentile, not the 1st.** An HCR channel
+is mostly background — measured on a real 20× dorsal stack, the median normalised
+intensity is 0.004 and the 99.5th percentile is only 0.098. The 1st percentile of
+the *image* therefore sits at the bottom of the background, not above it: it floors
+nothing, and the narrow high limit then stretches the dim background shoulder all
+the way to full scale. On that real stack, `p1/p99.5` put **36–41 % of pixels above
+the 0.05 signal threshold**, so essentially every nucleus read as expressing.
+`p90/p99.9` gives 6.5–8.2 %. `auto_contrast_limits` reports the resulting positive
+fraction per channel and warns above 25 %, so a bad automatic choice is visible
+rather than silent — but this is still the reason to use the widget.
+
 **Why registration downsamples uniformly in space.** Uniform-at-random sampling
 keeps dense regions dense, and ICP then fits the dense regions and ignores the
 sparse ones. `isotropic_downsample` normalises each axis to [0,1] first, so z (a
@@ -193,6 +212,13 @@ Larger `k` blurs domain boundaries. `atlas_diagnostics` reports the neighbour
 radius and how many distinct embryos actually contributed, which is how you tell
 whether an atlas point is a consensus or just one embryo. `exclude_self_embryo=True`
 makes it a genuine leave-one-out consensus.
+
+**Why XZ/YZ panels are not forced to equal aspect.** `x` is in xy pixels and `z` in
+bin indices — incommensurate units. Forcing `aspect="equal"` across them squashes
+the embryo into a flat pancake that looks like a property of the sample rather than
+of the axes. XY panels (pixels against pixels) get equal aspect; XZ/YZ autoscale
+unless you pass `z_aspect=<voxel anisotropy>`, which draws them in true proportion.
+Axis labels state their unit.
 
 **Two colour schemes, two themes.** `plot_pointcloud_3d` colours one gene per
 panel on a black-to-hue ramp — quantitative, for "where is this gene on".

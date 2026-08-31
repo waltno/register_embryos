@@ -31,6 +31,7 @@ import pandas as pd
 
 __all__ = [
     "GENE_RGB",
+    "XY_AXES",
     "Theme",
     "DARK",
     "LIGHT",
@@ -443,15 +444,64 @@ def _projection_cols(coord_cols: Sequence[str]) -> List[Tuple[str, str, str]]:
     return [(x, y, "XY"), (x, z, "XZ"), (y, z, "YZ")]
 
 
-def _style_axes(ax, theme: Theme, xlabel: str, ylabel: str, title: str) -> None:
+XY_AXES = frozenset({"x", "y", "x_reg", "y_reg", "x_um", "y_um"})
+
+
+def _axis_unit(column: str) -> str:
+    """Which physical unit an axis is in: xy pixels, z bins, or micrometres."""
+    if column.endswith("_um"):
+        return "um"
+    base = column.replace("_reg", "")
+    return "xy_px" if base in ("x", "y") else "z_bin"
+
+
+def _style_axes(
+    ax,
+    theme: Theme,
+    xlabel: str,
+    ylabel: str,
+    title: str,
+    z_aspect: Optional[float] = None,
+) -> None:
+    """Label and colour a panel, and set an aspect ratio that does not lie.
+
+    ``aspect="equal"`` is only meaningful when both axes are in the same unit.
+    An XY panel is x-pixels against y-pixels, so equal is right.  An XZ panel is
+    x-*pixels* against z-*bin indices*: forcing equal there squashes the embryo
+    into a one-pixel-tall pancake and makes it look flat, which is an artefact of
+    the units, not of the sample.
+
+    Args:
+        z_aspect: how many xy pixels one z step is worth -- i.e. the voxel
+            anisotropy.  Given it, XZ/YZ panels are drawn in true proportion.
+            Without it they are left to autoscale, which fills the panel and
+            distorts nothing silently.
+    """
     ax.set_facecolor(theme.paper)
     ax.set_title(title, color=theme.font, fontsize=9)
-    ax.set_xlabel(xlabel.replace("_reg", ""), color=theme.axis_label, fontsize=8)
-    ax.set_ylabel(ylabel.replace("_reg", ""), color=theme.axis_label, fontsize=8)
+
+    units = (_axis_unit(xlabel), _axis_unit(ylabel))
+    suffix = {"xy_px": " (px)", "z_bin": " (z-bins)", "um": " (um)"}
+    ax.set_xlabel(
+        xlabel.replace("_reg", "").replace("_um", "") + suffix[units[0]],
+        color=theme.axis_label, fontsize=8,
+    )
+    ax.set_ylabel(
+        ylabel.replace("_reg", "").replace("_um", "") + suffix[units[1]],
+        color=theme.axis_label, fontsize=8,
+    )
     ax.tick_params(colors=theme.axis_label, labelsize=7)
     for spine in ax.spines.values():
         spine.set_color(theme.grid)
-    ax.set_aspect("equal", adjustable="datalim")
+
+    if units[0] == units[1]:
+        ax.set_aspect("equal", adjustable="datalim")
+    elif z_aspect:
+        # Mixed units, but the conversion factor is known: 1 z step = z_aspect px.
+        ratio = z_aspect if units[1] == "z_bin" else 1.0 / z_aspect
+        ax.set_aspect(ratio, adjustable="datalim")
+    else:
+        ax.set_aspect("auto")
 
 
 def _save_fig(fig, theme: Theme, save_path: Optional[str | Path]) -> Optional[Path]:
@@ -473,6 +523,7 @@ def plot_additive_2d(
     size_scale: float = 1.6,
     save_path: Optional[str | Path] = None,
     panel_size: float = 4.2,
+    z_aspect: Optional[float] = None,
     **style_kwargs,
 ):
     """Additive overlay as XY/XZ/YZ projections, one row per frame.
@@ -480,6 +531,10 @@ def plot_additive_2d(
     Args:
         frames: a dataframe, or ``[(label, dataframe), ...]`` for one row each --
             the shape to use for stacking per-embryo rows or comparing atlases.
+        z_aspect: xy pixels per z step (the voxel anisotropy), so the XZ/YZ panels
+            are drawn in true proportion.  Without it they autoscale -- x is in
+            pixels and z in bin indices, and forcing equal aspect across those two
+            makes the embryo look flat.
     """
     import matplotlib
     import matplotlib.pyplot as plt
@@ -512,20 +567,24 @@ def plot_additive_2d(
             ax = axes[row][column]
             # Silent first (translucent) so expressing nuclei on top are never
             # hidden behind the grey background layer.
+            # Positional indexing throughout: the style arrays are positional, and
+            # a frame sliced out of a concatenated table keeps its original labels,
+            # so .loc with positional integers raises (or worse, silently
+            # mismatches rows against their colours).
+            x_all = df[cx].to_numpy()
+            y_all = df[cy].to_numpy()
             for mask, alpha, stroke_alpha in ((~hi, 0.55, 0.35), (hi, 1.0, 0.9)):
                 if not mask.any():
                     continue
                 ax.scatter(
-                    df.loc[mask.nonzero()[0], cx] if isinstance(df.index, pd.RangeIndex)
-                    else df[cx].to_numpy()[mask],
-                    df[cy].to_numpy()[mask],
+                    x_all[mask], y_all[mask],
                     c=rgb[mask], s=sizes[mask], alpha=alpha,
                     linewidths=0.25,
                     edgecolors=matplotlib.colors.to_rgba(theme.stroke, stroke_alpha),
                     rasterized=True,
                 )
             title = f"{label} — {panel}" if label else panel
-            _style_axes(ax, theme, cx, cy, title)
+            _style_axes(ax, theme, cx, cy, title, z_aspect=z_aspect)
 
     handles = [
         matplotlib.patches.Patch(color=colour, label=gene) for gene, colour in hexes.items()
@@ -552,6 +611,7 @@ def plot_gene_panels_2d(
     threshold: float = INTENSITY_THRESH,
     save_path: Optional[str | Path] = None,
     panel_size: float = 4.0,
+    z_aspect: Optional[float] = None,
 ):
     """One panel per gene in a single projection, silent nuclei as grey context."""
     import matplotlib
@@ -574,23 +634,24 @@ def plot_gene_panels_2d(
         cmap = LinearSegmentedColormap.from_list(
             f"{gene}_ramp", [_hex(theme.silent_rgb), _hex(gene_color(gene, column))]
         )
-        positive = df[gene].fillna(0) >= threshold
+        positive = (df[gene].fillna(0) >= threshold).to_numpy()
+        x_all, y_all = df[cx].to_numpy(), df[cy].to_numpy()
+        values = df[gene].fillna(0).to_numpy()
         ax.scatter(
-            df.loc[~positive, cx], df.loc[~positive, cy],
+            x_all[~positive], y_all[~positive],
             c=[theme.silent_rgb], s=2, alpha=0.35, rasterized=True,
         )
         if positive.any():
-            cap = float(df.loc[positive, gene].quantile(0.99)) or 1.0
+            cap = float(np.quantile(values[positive], 0.99)) or 1.0
             scatter = ax.scatter(
-                df.loc[positive, cx], df.loc[positive, cy],
-                c=df.loc[positive, gene], cmap=cmap, vmin=threshold, vmax=cap,
+                x_all[positive], y_all[positive],
+                c=values[positive], cmap=cmap, vmin=threshold, vmax=cap,
                 s=7, alpha=0.9, rasterized=True,
             )
             bar = fig.colorbar(scatter, ax=ax, shrink=0.75)
             bar.ax.tick_params(colors=theme.axis_label, labelsize=6)
-        _style_axes(
-            ax, theme, cx, cy, f"{gene} — {int(positive.sum()):,} positive"
-        )
+        _style_axes(ax, theme, cx, cy, f"{gene} — {int(positive.sum()):,} positive",
+                    z_aspect=z_aspect)
 
     if suptitle:
         fig.suptitle(suptitle, color=theme.font, fontsize=12)
@@ -609,6 +670,7 @@ def plot_registration_2d(
     panel_size: float = 3.6,
     reference_color: str = "#1f1f1f",
     embryo_color: str = "#FF4500",
+    z_aspect: Optional[float] = None,
 ):
     """QC view: each embryo against the reference, before and after ICP.
 
@@ -653,7 +715,7 @@ def plot_registration_2d(
                 subset[cx], subset[cy],
                 c=embryo_color, s=1.5, alpha=0.45, rasterized=True, label=embryo_id,
             )
-            _style_axes(ax, theme, cx, cy, panel_title)
+            _style_axes(ax, theme, cx, cy, panel_title, z_aspect=z_aspect)
         axes[row][0].set_ylabel(
             embryo_id.replace("_", "\n"), color=theme.font, fontsize=7
         )

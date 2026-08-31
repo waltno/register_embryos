@@ -142,31 +142,71 @@ class ContrastLimits:
 
 def auto_contrast_limits(
     volumes: Sequence[EmbryoVolume],
-    low_percentile: float = 1.0,
-    high_percentile: float = 99.5,
+    low_percentile: float = 90.0,
+    high_percentile: float = 99.9,
     transform: str = "none",
+    signal_threshold: float = 0.05,
+    warn_above_positive_fraction: float = 0.25,
     verbose: bool = True,
 ) -> ContrastLimits:
     """Percentile contrast limits for every embryo and channel.
 
-    A reasonable starting point and a fine default for a batch run, but HCR
-    background varies enough between embryos that the widget usually beats it --
-    the high percentile is set by however much bright junk a given embryo has.
+    A starting point, not a substitute for the widget.
+
+    ``low_percentile`` defaults to 90, not 1, and the reason matters.  An HCR
+    channel is mostly background: the great majority of pixels carry no signal, so
+    the 1st percentile of the *image* is the bottom of the background, not the top
+    of it.  Using it puts the low limit at ~0, floors nothing, and then the narrow
+    high limit stretches faint background all the way to full scale -- after which
+    essentially every nucleus reads as expressing.  Putting the low limit up where
+    most of the background already lies is what actually separates signal from it.
+
+    The right percentile depends on how much of the field is genuinely positive,
+    which is exactly what the widget lets you judge by eye.  This function reports
+    the resulting positive fraction per channel and warns when it is implausibly
+    high, so a bad automatic choice is visible rather than silent.
+
+    Args:
+        low_percentile: intensity percentile mapped to 0.  Raise it for a sparser
+            channel, lower it for a broadly expressed one.
+        signal_threshold: threshold the positive-fraction diagnostic reports
+            against; match it to what you pass to the assignment step.
+        warn_above_positive_fraction: warn when more than this fraction of pixels
+            would end up above ``signal_threshold``.  0.25 because the observed
+            failure on real data sat at 36-44%: a gene channel with a quarter of
+            its pixels positive is background contamination, not expression.
     """
     result = ContrastLimits(transform=transform)
     for volume in volumes:
+        diagnostics = []
         for channel, data in sorted(volume.binned_channels.items()):
             array = _transform_array(data, transform)
             lo, hi = np.percentile(array, [low_percentile, high_percentile])
             if hi <= lo:
                 lo, hi = float(array.min()), float(array.max()) or 1.0
             result.set(volume.embryo_id, channel, float(lo), float(hi))
+
+            positive = float((apply_contrast(array, (lo, hi)) > signal_threshold).mean())
+            diagnostics.append((channel, float(lo), float(hi), positive))
+
         if verbose:
             rendered = "  ".join(
-                f"ch{ch}=({lo:.3f},{hi:.3f})"
-                for ch, (lo, hi) in sorted(result[volume.embryo_id].items())
+                f"ch{ch}=({lo:.3f},{hi:.3f})[{positive:.0%}+]"
+                for ch, lo, hi, positive in diagnostics
             )
             print(f"  {volume.embryo_id}: {rendered}")
+            for channel, lo, hi, positive in diagnostics:
+                if channel == 0:
+                    continue          # the nuclear stain is broadly positive by design
+                if positive > warn_above_positive_fraction:
+                    print(
+                        f"    [WARN] ch{channel} "
+                        f"({volume.gene_map.get(channel, '?')}): {positive:.0%} of "
+                        f"pixels land above the {signal_threshold} signal threshold. "
+                        f"That is almost certainly background stretched into signal -- "
+                        f"raise low_percentile (currently {low_percentile:g}) or set "
+                        f"this channel in the widget."
+                    )
     return result
 
 

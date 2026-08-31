@@ -42,7 +42,10 @@ from .orientation import OrientationSet, apply_orientation_to_volumes
 from .registration import RegistrationResult, register_cohort
 from .segmentation import SegmentedEmbryo, segment_cohort
 
-__all__ = ["CohortWorkflow", "CohortOutputs", "run_cohort", "run_all_cohorts", "scan"]
+__all__ = [
+    "CohortWorkflow", "CohortOutputs", "run_cohort", "run_all_cohorts", "scan",
+    "DEFAULT_BIN_SIZE", "default_bin_size",
+]
 
 
 @dataclass
@@ -294,6 +297,12 @@ class CohortWorkflow:
             raise RuntimeError("call load() (and usually apply_prep()) first")
         if not self.adjusted:
             print("  [NOTE] segmenting un-adjusted volumes; apply_prep() was not run")
+        if mode == "3d" and volumes[0].bin_size != 1:
+            raise ValueError(
+                f"mode='3d' needs the unbinned z-stack, but this cohort was loaded "
+                f"with bin_size={volumes[0].bin_size}. Re-run load(bin_size=1) "
+                f"(and apply_prep again), or segment with mode='2d' / '2d+link'."
+            )
 
         print(f"\n{'='*72}\nSEGMENT ({mode}) — {self.cohort.name}\n{'='*72}")
         self.segmented = segment_cohort(
@@ -505,12 +514,23 @@ def _package_version() -> str:
         return "unknown"
 
 
+#: z-bins per segmentation mode.  3D takes the whole stack unbinned -- binning is
+#: a concession for 2D, which needs each plane to carry enough signal to segment
+#: on its own, and it destroys exactly the z information 3D works from.
+DEFAULT_BIN_SIZE = {"2d": 7, "2d+link": 7, "3d": 1}
+
+
+def default_bin_size(segmentation_mode: str) -> int:
+    """Sensible z-binning for a segmentation mode."""
+    return DEFAULT_BIN_SIZE.get(segmentation_mode, 7)
+
+
 def run_cohort(
     input_dir: str | Path,
     output_root: str | Path,
     cohort: Optional[str] = None,
     timepoint: Optional[str] = None,
-    bin_size: int = 7,
+    bin_size: Optional[int] = None,
     segmentation_mode: str = "2d",
     diameter: Optional[float] = None,
     gpu: bool = False,
@@ -534,10 +554,24 @@ def run_cohort(
     that is fine for a look, but the accepted-by-eye values from the widget are
     what you want for anything you intend to interpret -- a percentile high limit
     is set by whatever bright debris an embryo happens to carry.
+
+    Args:
+        bin_size: z-planes per bin.  ``None`` picks the right value for
+            ``segmentation_mode``: 7 for 2D, and **1 for 3D**, which takes the
+            whole stack unbinned.
     """
     workflow = CohortWorkflow.from_directory(
         input_dir, output_root=output_root, cohort=cohort, timepoint=timepoint
     )
+    if bin_size is None:
+        bin_size = default_bin_size(segmentation_mode)
+        if verbose:
+            print(f"  bin_size={bin_size} (default for mode={segmentation_mode!r})")
+    elif segmentation_mode == "3d" and bin_size != 1:
+        raise ValueError(
+            f"mode='3d' takes the unbinned z-stack, but bin_size={bin_size} was "
+            f"requested. Pass bin_size=1 (or leave it unset), or use mode='2d'."
+        )
     workflow.load(bin_size=bin_size, verbose=verbose)
 
     orientations = (
