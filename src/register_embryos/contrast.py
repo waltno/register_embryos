@@ -86,7 +86,7 @@ class ContrastLimits:
 
     # -- persistence --------------------------------------------------------
 
-    def save(self, path: str | Path) -> Path:
+    def save(self, path: str | Path, verbose: bool = True) -> Path:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -98,7 +98,8 @@ class ContrastLimits:
         }
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, sort_keys=True)
-        print(f"  [CONTRAST] saved {len(self.limits)} embryo(s) -> {path}")
+        if verbose:
+            print(f"  [CONTRAST] saved {len(self.limits)} embryo(s) -> {path}")
         return path
 
     @classmethod
@@ -518,6 +519,7 @@ def contrast_widget(
             )
             fig.tight_layout()
             plt.show()
+            plt.close(fig)      # pyplot retains figures; this redraws per tick
 
     def sync_channel_options(*_) -> None:
         volume = current_volume()
@@ -544,7 +546,7 @@ def contrast_widget(
 
     def maybe_autosave() -> None:
         if autosave and save_path:
-            result.save(save_path)
+            result.save(save_path, verbose=False)
 
     def on_accept(_) -> None:
         volume = current_volume()

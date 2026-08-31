@@ -113,7 +113,7 @@ class OrientationSet:
     def set(self, embryo_id: str, orientation: Orientation) -> None:
         self.orientations[embryo_id] = orientation
 
-    def save(self, path: str | Path) -> Path:
+    def save(self, path: str | Path, verbose: bool = True) -> Path:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as handle:
@@ -121,7 +121,8 @@ class OrientationSet:
                 {eid: asdict(o) for eid, o in self.orientations.items()},
                 handle, indent=2, sort_keys=True,
             )
-        print(f"  [ORIENT] saved {len(self.orientations)} embryo(s) -> {path}")
+        if verbose:
+            print(f"  [ORIENT] saved {len(self.orientations)} embryo(s) -> {path}")
         return path
 
     @classmethod

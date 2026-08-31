@@ -46,11 +46,11 @@ class PrepConfig:
     orientation_path: Optional[Path] = None
     contrast_path: Optional[Path] = None
 
-    def save(self) -> None:
+    def save(self, verbose: bool = True) -> None:
         if self.orientation_path:
-            self.orientations.save(self.orientation_path)
+            self.orientations.save(self.orientation_path, verbose=verbose)
         if self.contrast_path:
-            self.contrast.save(self.contrast_path)
+            self.contrast.save(self.contrast_path, verbose=verbose)
 
     @classmethod
     def load(cls, output_dir: str | Path) -> "PrepConfig":
@@ -319,6 +319,11 @@ def prepare_widget(
             )
             fig.tight_layout()
             plt.show()
+            # Close it: pyplot keeps every figure alive until told otherwise, and
+            # this redraws on each slider tick, dropdown change and Accept. A
+            # 7-embryo, 4-channel session runs to hundreds of figures and the
+            # notebook slows to a crawl long before the cohort is finished.
+            plt.close(fig)
 
     def sync_embryo(*_) -> None:
         volume = current_volume()
@@ -346,8 +351,11 @@ def prepare_widget(
         redraw()
 
     def maybe_autosave() -> None:
+        # Quiet: this fires on every Accept, and two log lines per click buries
+        # the widget under its own output. The status line confirms the action,
+        # and the progress counter shows the totals.
         if autosave:
-            config.save()
+            config.save(verbose=False)
 
     def on_accept_rotation(_) -> None:
         volume = current_volume()
