@@ -342,12 +342,17 @@ def build_nucleus_table(
             segmented.nuclear_masks, signal_mask, verbose=verbose
         )
 
+    # Reduce by whether the LABELS are z-consistent, not by whether Cellpose ran
+    # in 3D.  Assignment above is chosen by is_3d (a 2d+link volume still has
+    # per-slice mask extents, so per-slice assignment is right and cheaper), but
+    # the reduction must follow the labels: linked ids identify one object across
+    # planes, so it gets one row and a true 3D centroid.
     table = nucleus_table(
         embryo_id=volume.embryo_id,
         assigned_masks=assigned,
         channels_filtered=channels_filtered,
         gene_map=volume.gene_map,
-        mode="3d" if segmented.is_3d else "2d",
+        mode="3d" if segmented.labels_are_3d else "2d",
         voxel=(binned_voxel.xy_um, binned_voxel.z_um),
         verbose=verbose,
     )
@@ -365,7 +370,7 @@ def build_nucleus_table(
         gene_map=volume.gene_map,
         nd2_path=volume.nd2_path,
         output_dir=str(segmented.output_dir) if segmented.output_dir else "",
-        mode="3d" if segmented.is_3d else "2d",
+        mode=segmented.mode,
         voxel_um=(binned_voxel.xy_um, binned_voxel.z_um),
         masks_path=str(segmented.masks_path) if segmented.masks_path else "",
         assigned_masks_path=assigned_path,

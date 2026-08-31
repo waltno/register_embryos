@@ -83,7 +83,25 @@ class SegmentedEmbryo:
 
     @property
     def is_3d(self) -> bool:
+        """Whether Cellpose ran a genuine 3D pass.
+
+        Governs how signal pixels are assigned: 3D assignment measures distances
+        in micrometres through the volume, 2D assignment works within each slice.
+        """
         return self.mode == "3d"
+
+    @property
+    def labels_are_3d(self) -> bool:
+        """Whether a label id means the same object on every z-plane it appears on.
+
+        True for ``3d`` and for ``2d+link`` -- the whole point of the linking pass
+        is that ids become globally consistent.  This is a *different* question
+        from :attr:`is_3d`, and conflating them made ``2d+link`` pointless: the
+        nucleus table was reduced per-slice, so a linked nucleus still produced one
+        row per plane and the linking was discarded at exactly the step that was
+        supposed to benefit from it.
+        """
+        return self.mode in ("3d", "2d+link")
 
 
 def available_cpus() -> int:

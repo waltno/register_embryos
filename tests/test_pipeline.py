@@ -808,3 +808,140 @@ def test_a_reloaded_config_applies_to_volumes(tmp_path):
     assert any("contrast applied" in note for note in adjusted[0].history)
     for array in adjusted[0].binned_channels.values():
         assert 0.0 <= array.min() and array.max() <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# 2d vs 2d+link vs 3d: what each actually produces
+# ---------------------------------------------------------------------------
+
+def _spanning_masks():
+    """One nucleus present on all 3 planes, plus one present on a single plane.
+
+    In a genuine 2D run the first would carry an unrelated label on each plane; here
+    the labels are already globally consistent, which is what a linking pass (or a
+    3D pass) produces.
+    """
+    masks = np.zeros((3, 20, 20), dtype=int)
+    masks[:, 4:10, 4:10] = 1        # spans z = 0, 1, 2
+    masks[1, 14:18, 14:18] = 2      # z = 1 only
+    return masks
+
+
+def _segmented(mode, masks=None, gene_value=0.0):
+    """A SegmentedEmbryo with controllable gene signal.
+
+    ``gene_value=0`` leaves the signal mask empty, so no pixels are reassigned and
+    each nucleus keeps exactly its mask voxels.  That isolates the *reduction* --
+    how label volumes become table rows -- from the assignment step, which is what
+    these tests are about.  A nonzero value blankets the frame with signal and
+    every nucleus's territory expands to fill it.
+    """
+    from register_embryos.imaging import EmbryoVolume, VoxelSize
+    from register_embryos.naming import parse_embryo_name
+    from register_embryos.segmentation import SegmentedEmbryo
+
+    gene = np.full((3, 20, 20), gene_value, np.float32)
+    volume = EmbryoVolume(
+        name=parse_embryo_name("20260410_1.5_wt_12s_dorsal_20X_hand2_tbx1_wt1a.nd2"),
+        binned_channels={0: np.ones((3, 20, 20), np.float32), 1: gene,
+                         2: gene.copy(), 3: gene.copy()},
+        voxel=VoxelSize(0.863, 1.5), bin_size=7, c_size=4, z_size=21,
+    )
+    return SegmentedEmbryo(
+        volume=volume,
+        nuclear_masks=_spanning_masks() if masks is None else masks,
+        mode=mode,
+    )
+
+
+def test_labels_are_3d_is_not_the_same_question_as_is_3d():
+    """2d+link has z-consistent labels without Cellpose having run in 3D."""
+    assert not _segmented("2d").labels_are_3d
+    assert not _segmented("2d").is_3d
+
+    linked = _segmented("2d+link")
+    assert linked.labels_are_3d          # ids mean one object across planes
+    assert not linked.is_3d              # but the masks came from 2D passes
+
+    volumetric = _segmented("3d")
+    assert volumetric.labels_are_3d and volumetric.is_3d
+
+
+def test_plain_2d_emits_one_row_per_plane():
+    """Per-slice labels: a spanning nucleus is several rows with unrelated ids."""
+    from register_embryos.assignment import build_nucleus_table
+
+    df = build_nucleus_table(_segmented("2d"), save=False, verbose=False).nucleus_df
+    assert len(df) == 4                                   # 3 planes + 1
+    assert sorted(df[df["nucleus_id"] == 1]["z"]) == [0.0, 1.0, 2.0]
+
+
+def test_linking_collapses_a_spanning_nucleus_to_one_row():
+    """Regression: 2d+link produced a table identical to plain 2d.
+
+    The linking pass made ids z-consistent, but the reduction keyed off is_3d
+    (False for 2d+link) and so still went per-plane -- discarding the linking at
+    exactly the step meant to benefit from it, and leaving the duplicate centroids
+    that 2d+link exists to remove.
+    """
+    from register_embryos.assignment import build_nucleus_table
+
+    plain = build_nucleus_table(_segmented("2d"), save=False, verbose=False).nucleus_df
+    linked = build_nucleus_table(_segmented("2d+link"), save=False, verbose=False).nucleus_df
+
+    assert len(linked) < len(plain)
+    assert len(linked) == 2                       # one row per object
+    assert linked["nucleus_id"].is_unique
+    # A true 3D centroid: the mean of planes 0, 1 and 2.
+    spanning = linked[linked["nucleus_id"] == 1].iloc[0]
+    assert spanning["z"] == pytest.approx(1.0)
+    # It accounts for every voxel of the object, not just one plane's worth.
+    # (gene_value=0 so nothing is reassigned; the count is the mask itself.)
+    assert spanning["n_voxels"] == 3 * 36
+
+
+def test_linked_and_3d_reductions_agree_on_the_same_masks():
+    """With no signal to reassign, the two z-consistent modes reduce identically.
+
+    They still differ in general, because 2d+link assigns signal pixels within
+    each plane while 3d assigns them through the volume in micrometres -- so this
+    holds only once assignment is taken out of the picture.
+    """
+    from register_embryos.assignment import build_nucleus_table
+
+    linked = build_nucleus_table(
+        _segmented("2d+link"), save=False, verbose=False).nucleus_df
+    volumetric = build_nucleus_table(
+        _segmented("3d"), save=False, verbose=False).nucleus_df
+
+    assert len(linked) == len(volumetric)
+    for column in ("nucleus_id", "x", "y", "z", "n_voxels"):
+        assert linked[column].tolist() == pytest.approx(volumetric[column].tolist())
+
+
+def test_link_and_3d_assignment_differ_when_there_is_signal_to_spread():
+    """The remaining real difference: per-plane vs through-volume assignment.
+
+    2d+link keeps 2D assignment (each plane's signal joins a nucleus on that
+    plane); 3d measures distance through the stack in micrometres. With signal
+    everywhere the resulting territories are genuinely different, and neither is
+    a bug.
+    """
+    from register_embryos.assignment import build_nucleus_table
+
+    linked = build_nucleus_table(
+        _segmented("2d+link", gene_value=0.6), save=False, verbose=False).nucleus_df
+    volumetric = build_nucleus_table(
+        _segmented("3d", gene_value=0.6), save=False, verbose=False).nucleus_df
+
+    assert len(linked) == len(volumetric) == 2          # same objects
+    assert linked["n_voxels"].tolist() != volumetric["n_voxels"].tolist()
+
+
+def test_the_recorded_mode_distinguishes_the_three():
+    """The EmbryoResult must say which mode produced it, for provenance."""
+    from register_embryos.assignment import build_nucleus_table
+
+    for mode in ("2d", "2d+link", "3d"):
+        result = build_nucleus_table(_segmented(mode), save=False, verbose=False)
+        assert result.mode == mode

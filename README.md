@@ -154,11 +154,27 @@ out/wt_12s_dorsal_20X/
 
 ## Segmentation modes
 
-| mode | z input | what it does | when |
-|---|---|---|---|
-| `2d` | binned (`bin_size=7`) | Cellpose on each z-bin independently | fast, robust; labels are per-slice so one nucleus spanning two bins becomes two rows |
-| `3d` | **unbinned** (`bin_size=1`) | one Cellpose pass with `do_3D=True` and the voxel anisotropy | labels consistent through z, so a nucleus is one row with a true 3D centroid — the right input for ICP |
-| `2d+link` | binned | 2D Cellpose, then link slices by mask IoU | middle ground; removes duplicate centroids without the cost of 3D flow |
+| mode | z input | Cellpose runs | label ids | one nucleus becomes | signal assignment |
+|---|---|---|---|---|---|
+| `2d` | binned (`bin_size=7`) | once per z-plane | restart on every plane | **one row per plane**, ids unrelated between planes | within each plane |
+| `2d+link` | binned | once per z-plane (identical to `2d`) | linked across planes by mask IoU | **one row**, true 3D centroid | within each plane |
+| `3d` | **unbinned** (`bin_size=1`) | once over the whole volume (`do_3D`, voxel anisotropy) | consistent by construction | **one row**, true 3D centroid | through the volume, in µm |
+
+`2d` and `2d+link` do *exactly the same segmentation* — same Cellpose calls, same
+masks, same cost. The only difference is identity: `2d+link` then walks z and gives
+a label the id of the label below it wherever their pixel IoU clears a threshold
+(default 0.25). That matters because per-plane ids make a nucleus spanning two
+planes look like two nuclei at nearly the same xy — duplicate points stacked in z,
+which ICP then fits as if they were real structure. `2d+link` removes those for the
+cost of one pass over the masks, with no extra Cellpose work.
+
+What `2d+link` *cannot* do is split a blob that 2D already merged — only a genuine
+3D pass can. And it keeps per-plane assignment, so it does not get 3D's
+micrometre-aware territory either.
+
+Choosing: `2d` when you only want per-plane intensities and will not register;
+`2d+link` as the default when you will register but cannot spend GPU time;
+`3d` when nucleus identity has to be right and you have a GPU.
 
 **3D takes the whole z-stack, unbinned — this is enforced, not advisory.** z-binning
 is a concession made for 2D: it max-projects several planes into one so each plane
