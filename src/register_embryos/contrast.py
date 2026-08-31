@@ -182,10 +182,10 @@ def auto_contrast_limits(
         diagnostics = []
         for channel, data in sorted(volume.binned_channels.items()):
             array = _transform_array(data, transform)
-            lo, hi = np.percentile(array, [low_percentile, high_percentile])
-            if hi <= lo:
-                lo, hi = float(array.min()), float(array.max()) or 1.0
-            result.set(volume.embryo_id, channel, float(lo), float(hi))
+            lo, hi = _widen_if_degenerate(
+                *np.percentile(array, [low_percentile, high_percentile]), array
+            )
+            result.set(volume.embryo_id, channel, lo, hi)
 
             positive = float((apply_contrast(array, (lo, hi)) > signal_threshold).mean())
             diagnostics.append((channel, float(lo), float(hi), positive))
@@ -237,6 +237,25 @@ def _transform_array(array: np.ndarray, transform: str) -> np.ndarray:
     raise ValueError(f"unknown transform {transform!r} (expected 'none' or 'log2')")
 
 
+def _widen_if_degenerate(lo: float, hi: float, array: np.ndarray) -> Limits:
+    """Ensure ``hi > lo`` for an automatically derived window.
+
+    Percentiles collapse on a near-uniform frame -- an almost-empty channel, or a
+    z-bin outside the sample -- and a zero-width window is not a usable contrast
+    limit.  Only ever applied to *derived* limits: an inverted window that a
+    caller supplied explicitly should still raise, because that is a mistake worth
+    hearing about.
+    """
+    lo, hi = float(lo), float(hi)
+    if hi > lo:
+        return lo, hi
+    array_min, array_max = float(np.min(array)), float(np.max(array))
+    if array_max > array_min:
+        return array_min, array_max
+    # Entirely uniform: any nonzero width will render as a flat frame, correctly.
+    return array_min, array_min + 1e-6
+
+
 def apply_contrast(array: np.ndarray, limits: Limits) -> np.ndarray:
     """Clip to ``limits`` and rescale that window onto [0, 1]."""
     vmin, vmax = limits
@@ -286,21 +305,107 @@ def apply_contrast_to_volumes(
 # Static preview (works in any notebook, no widgets needed)
 # ---------------------------------------------------------------------------
 
+def _resolve_prep(
+    volume: EmbryoVolume,
+    config,
+    contrast: Optional[ContrastLimits],
+    orientation,
+    transform: str,
+):
+    """Pull this embryo's contrast limits, orientation and transform from whatever was passed.
+
+    ``config`` may be a :class:`~register_embryos.widgets.PrepConfig`.  It is
+    duck-typed rather than imported, because ``widgets`` imports this module and a
+    real import would be circular.
+    """
+    resolved_contrast = contrast
+    resolved_orientation = orientation
+    resolved_transform = transform
+
+    if config is not None:
+        if hasattr(config, "orientations") and hasattr(config, "contrast"):
+            resolved_contrast = resolved_contrast or config.contrast
+            if resolved_orientation is None:
+                resolved_orientation = config.orientations.get(volume.embryo_id)
+            resolved_transform = config.contrast.transform
+        elif isinstance(config, ContrastLimits):
+            # Tolerate preview_contrast(volume, contrast_limits) positionally,
+            # which is how it read before orientation was handled here.
+            resolved_contrast = resolved_contrast or config
+            resolved_transform = config.transform
+        else:
+            raise TypeError(
+                f"config must be a PrepConfig or ContrastLimits, got "
+                f"{type(config).__name__}"
+            )
+
+    if resolved_contrast is not None and transform == "none":
+        resolved_transform = resolved_contrast.transform
+
+    return resolved_contrast, resolved_orientation, resolved_transform
+
+
 def preview_contrast(
     volume: EmbryoVolume,
+    config=None,
     contrast: Optional[ContrastLimits] = None,
+    orientation=None,
     z_index: Optional[int] = None,
     transform: str = "none",
     channels: Optional[Iterable[int]] = None,
+    max_projection: bool = False,
+    resize: bool = False,
     figsize_per_panel: Tuple[float, float] = (3.6, 3.6),
     save_path: Optional[str | Path] = None,
 ):
-    """Grid of ``raw | histogram | clipped`` rows, one row per channel.
+    """Grid of ``oriented raw | histogram | clipped`` rows, one row per channel.
 
-    The non-interactive counterpart of :func:`contrast_widget`: use it to render
-    the accepted limits into a figure for a lab notebook or a QC folder.
+    The non-interactive counterpart of :func:`contrast_widget` /
+    :func:`~register_embryos.widgets.prepare_widget`: renders what segmentation
+    will actually receive, for a lab notebook or a QC folder.
+
+    **Rotation is applied here.**  Contrast alone is not the whole preparation
+    step -- an embryo also gets rotated -- so a preview that showed only contrast
+    would not match what gets segmented, and a wrong rotation would sail through
+    the QC unnoticed.  Pass the :class:`~register_embryos.widgets.PrepConfig` from
+    the widget and both are applied::
+
+        preview_contrast(volume, config)
+
+    Args:
+        config: the ``PrepConfig`` from the widget (carries both orientation and
+            contrast), or a bare :class:`ContrastLimits`.
+        contrast: contrast limits, if supplying them separately from ``config``.
+        orientation: an :class:`~register_embryos.orientation.Orientation` to
+            apply, overriding the one in ``config``.  Pass
+            ``Orientation()`` to preview explicitly unrotated.
+        z_index: which z-bin to show.  Defaults to the middle one.
+        max_projection: show the z max projection instead of one z-bin.
+        resize: grow the canvas on rotation instead of cropping to it.
     """
     import matplotlib.pyplot as plt
+
+    from .orientation import Orientation, rotate_frame
+
+    resolved_contrast, resolved_orientation, resolved_transform = _resolve_prep(
+        volume, config, contrast, orientation, transform
+    )
+    if resolved_orientation is None:
+        resolved_orientation = Orientation()
+
+    already_adjusted = any("contrast applied" in note for note in volume.history)
+    if already_adjusted and resolved_contrast is not None:
+        print(
+            f"  [WARN] {volume.embryo_id}: this volume already has contrast baked "
+            f"in ({volume.history}); applying limits again would double-clip. "
+            f"Preview it with contrast=None, or pass an unadjusted volume."
+        )
+    already_oriented = any("oriented" in note for note in volume.history)
+    if already_oriented and not resolved_orientation.is_identity:
+        print(
+            f"  [WARN] {volume.embryo_id}: this volume is already oriented; "
+            f"rotating again would compound the rotation."
+        )
 
     channel_list = sorted(channels) if channels is not None else sorted(volume.binned_channels)
     if z_index is None:
@@ -313,32 +418,61 @@ def preview_contrast(
         squeeze=False,
     )
     gene_map = volume.gene_map
+
     for row, channel in enumerate(channel_list):
-        data = _transform_array(volume.binned_channels[channel], transform)
-        frame = data[z_index]
-        limits = (
-            contrast.get(volume.embryo_id, channel)
-            if contrast is not None and volume.embryo_id in contrast
-            else tuple(np.percentile(frame, [1, 99.5]))
-        )
+        data = _transform_array(volume.binned_channels[channel], resolved_transform)
+
+        # Same order the widget and apply_orientation use: flips, then rotation.
+        if resolved_orientation.flip_z:
+            data = data[::-1]
+        frame = data.max(axis=0) if max_projection else data[min(z_index, data.shape[0] - 1)]
+        if resolved_orientation.flip_y:
+            frame = frame[::-1, :]
+        if resolved_orientation.flip_x:
+            frame = frame[:, ::-1]
+        if resolved_orientation.xy_rotation % 360:
+            frame = rotate_frame(frame, resolved_orientation.xy_rotation, resize=resize)
+
+        if resolved_contrast is not None and volume.embryo_id in resolved_contrast:
+            limits = resolved_contrast.get(volume.embryo_id, channel)
+        else:
+            limits = _widen_if_degenerate(*np.percentile(frame, [90, 99.9]), frame)
         label = gene_map.get(channel, "nuclei" if channel == 0 else f"ch{channel}")
 
         axes[row][0].imshow(frame, cmap="gray")
-        axes[row][0].set_title(f"ch{channel} {label} — raw", fontsize=9)
+        axes[row][0].set_title(
+            f"ch{channel} {label} — oriented raw ({frame.shape[0]}x{frame.shape[1]})",
+            fontsize=9,
+        )
         axes[row][0].axis("off")
 
         axes[row][1].hist(frame.reshape(-1), bins=200, color="#4477aa")
-        axes[row][1].axvline(limits[0], color="#cc3311", ls="--", lw=1.2, label=f"lo={limits[0]:.3f}")
-        axes[row][1].axvline(limits[1], color="#009988", ls="--", lw=1.2, label=f"hi={limits[1]:.3f}")
+        axes[row][1].axvline(limits[0], color="#cc3311", ls="--", lw=1.2,
+                             label=f"lo={limits[0]:.3f}")
+        axes[row][1].axvline(limits[1], color="#009988", ls="--", lw=1.2,
+                             label=f"hi={limits[1]:.3f}")
+        axes[row][1].axvspan(limits[0], limits[1], color="#ffdd55", alpha=0.18)
         axes[row][1].set_yscale("log")
         axes[row][1].set_title("intensity histogram", fontsize=9)
         axes[row][1].legend(fontsize=7)
 
-        axes[row][2].imshow(apply_contrast(frame, limits), cmap="gray", vmin=0, vmax=1)
-        axes[row][2].set_title(f"clipped ({limits[0]:.3f}, {limits[1]:.3f})", fontsize=9)
+        clipped = apply_contrast(frame, limits)
+        axes[row][2].imshow(clipped, cmap="gray", vmin=0, vmax=1)
+        positive = 100.0 * float((clipped > 0.05).mean())
+        saturated = 100.0 * float((frame >= limits[1]).mean())
+        axes[row][2].set_title(
+            f"what segmentation sees — {positive:.1f}% above 0.05, "
+            f"{saturated:.2f}% saturated",
+            fontsize=9,
+        )
         axes[row][2].axis("off")
 
-    fig.suptitle(f"{volume.embryo_id} — z-bin {z_index} (transform={transform})", fontsize=10)
+    view = "max projection" if max_projection else f"z-bin {z_index}"
+    fig.suptitle(
+        f"{volume.embryo_id}\n{view}  |  rotation: "
+        f"{resolved_orientation.describe()}  |  transform: {resolved_transform}",
+        fontsize=10,
+    )
     fig.tight_layout()
     if save_path:
         save_path = Path(save_path)
@@ -589,7 +723,7 @@ def contrast_widget(
 
     def on_auto(_) -> None:
         frame = frame_for_display()
-        lo, hi = np.percentile(frame, [1, 99])
+        lo, hi = _widen_if_degenerate(*np.percentile(frame, [1, 99]), frame)
         state["guard"] = True
         lo_slider.value = float(lo)
         hi_slider.value = float(max(hi, lo + 1e-3))

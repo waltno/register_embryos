@@ -114,6 +114,14 @@ made once and every later run is reproducible.
 No ipywidgets? `auto_contrast_limits()` + `preview_contrast()` and an explicit
 `OrientationSet.from_angles(ids, [215, 155, 165, 70])` cover the same ground.
 
+**Resuming, and QC.** `PrepConfig.load(cohort_dir)` rebuilds the config from the two
+JSON sidecars, so a session can be picked up later (`wf.prepare()` reloads
+automatically too). `preview_contrast(volume, config)` renders the accepted
+**rotation and contrast together** — pass the whole `config`, not `config.contrast`,
+or the figure shows contrast on an unrotated embryo and a wrong rotation passes QC
+unnoticed. The third panel reports the fraction of pixels above the signal
+threshold, which is the number worth checking.
+
 ## Command line
 
 ```bash

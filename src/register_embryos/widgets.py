@@ -25,7 +25,12 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .contrast import ContrastLimits, apply_contrast, _transform_array
+from .contrast import (
+    ContrastLimits,
+    _transform_array,
+    _widen_if_degenerate,
+    apply_contrast,
+)
 from .imaging import EmbryoVolume
 from .orientation import Orientation, OrientationSet, clipping_fraction, rotate_frame
 
@@ -411,7 +416,7 @@ def prepare_widget(
 
     def on_auto(_) -> None:
         frame = oriented_frame()
-        lo, hi = np.percentile(frame, [1, 99])
+        lo, hi = _widen_if_degenerate(*np.percentile(frame, [1, 99]), frame)
         state["guard"] = True
         lo_slider.value = float(lo)
         hi_slider.value = float(max(hi, lo + 1e-3))

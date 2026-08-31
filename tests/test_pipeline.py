@@ -584,3 +584,227 @@ def test_auto_contrast_reports_the_positive_fraction(capsys):
     out = capsys.readouterr().out
     assert "ch0=(" in out and "ch1=(" in out
     assert "+]" in out                         # the [NN%+] diagnostic
+
+
+# ---------------------------------------------------------------------------
+# preview_contrast must show rotation, not just contrast
+# ---------------------------------------------------------------------------
+
+def _asymmetric_volume():
+    """A volume with an off-centre blob, so a rotation is detectable in the pixels."""
+    from register_embryos.imaging import EmbryoVolume, VoxelSize
+    from register_embryos.naming import parse_embryo_name
+
+    data = np.zeros((3, 64, 64), np.float32)
+    data[:, 8:24, 8:40] = 0.8          # deliberately not centred or symmetric
+    return EmbryoVolume(
+        name=parse_embryo_name("20260410_1.5_wt_12s_dorsal_20X_hand2_tbx1_wt1a.nd2"),
+        binned_channels={0: data, 1: data.copy()},
+        voxel=VoxelSize(0.863, 1.5), bin_size=7, c_size=2, z_size=21,
+    )
+
+
+def _rendered_image(fig, row=0):
+    """Pixels of the left-hand 'oriented raw' panel of a given row."""
+    return np.asarray(fig.axes[row * 3].images[0].get_array())
+
+
+def test_preview_contrast_applies_the_rotation_from_a_prep_config():
+    """Regression: the preview showed contrast on the UNROTATED volume.
+
+    A QC figure that omits the rotation does not show what segmentation receives,
+    so a wrong rotation passes the check unnoticed.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    from register_embryos.contrast import ContrastLimits, preview_contrast
+    from register_embryos.orientation import Orientation, OrientationSet
+    from register_embryos.widgets import PrepConfig
+
+    volume = _asymmetric_volume()
+    eid = volume.embryo_id
+    config = PrepConfig(
+        orientations=OrientationSet({eid: Orientation(xy_rotation=90.0)}),
+        contrast=ContrastLimits.from_dict({eid: {0: (0.05, 0.5), 1: (0.05, 0.5)}}),
+    )
+
+    rotated = _rendered_image(preview_contrast(volume, config))
+    upright = _rendered_image(
+        preview_contrast(volume, config, orientation=Orientation())
+    )
+    assert not np.allclose(rotated, upright), "rotation was ignored"
+    assert rotated.shape == upright.shape        # canvas kept by default
+
+
+def test_preview_contrast_reports_the_rotation_in_the_title():
+    """The figure has to be self-documenting, or a QC folder is unreadable later."""
+    import matplotlib
+    matplotlib.use("Agg")
+    from register_embryos.contrast import ContrastLimits, preview_contrast
+    from register_embryos.orientation import Orientation, OrientationSet
+    from register_embryos.widgets import PrepConfig
+
+    volume = _asymmetric_volume()
+    eid = volume.embryo_id
+    config = PrepConfig(
+        orientations=OrientationSet({eid: Orientation(xy_rotation=155.0, flip_x=True)}),
+        contrast=ContrastLimits.from_dict({eid: {0: (0.05, 0.5), 1: (0.05, 0.5)}}),
+    )
+    title = preview_contrast(volume, config)._suptitle.get_text()
+    assert "155" in title and "flip x" in title
+    identity = preview_contrast(volume, config, orientation=Orientation())
+    assert "identity" in identity._suptitle.get_text()
+
+
+def test_preview_contrast_still_accepts_a_bare_contrast_limits():
+    """The older positional call style must keep working."""
+    import matplotlib
+    matplotlib.use("Agg")
+    from register_embryos.contrast import ContrastLimits, preview_contrast
+
+    volume = _asymmetric_volume()
+    limits = ContrastLimits.from_dict(
+        {volume.embryo_id: {0: (0.05, 0.5), 1: (0.05, 0.5)}}
+    )
+    assert preview_contrast(volume, limits) is not None
+
+
+def test_preview_contrast_warns_about_double_application(capsys):
+    """Previewing an already-adjusted volume with limits would clip it twice."""
+    import matplotlib
+    matplotlib.use("Agg")
+    from register_embryos.contrast import (
+        ContrastLimits, apply_contrast_to_volumes, preview_contrast,
+    )
+
+    volume = _asymmetric_volume()
+    limits = ContrastLimits.from_dict(
+        {volume.embryo_id: {0: (0.05, 0.5), 1: (0.05, 0.5)}}
+    )
+    adjusted = apply_contrast_to_volumes([volume], limits, verbose=False)[0]
+    preview_contrast(adjusted, limits)
+    assert "double-clip" in capsys.readouterr().out
+
+
+def test_preview_contrast_warns_about_double_rotation(capsys):
+    import matplotlib
+    matplotlib.use("Agg")
+    from register_embryos.contrast import preview_contrast
+    from register_embryos.orientation import Orientation, apply_orientation
+
+    volume = _asymmetric_volume()
+    oriented = apply_orientation(volume, Orientation(xy_rotation=90.0), verbose=False)
+    preview_contrast(oriented, orientation=Orientation(xy_rotation=90.0))
+    assert "compound the rotation" in capsys.readouterr().out
+
+
+def test_preview_contrast_rejects_a_config_of_the_wrong_type():
+    import matplotlib
+    matplotlib.use("Agg")
+    from register_embryos.contrast import preview_contrast
+
+    with pytest.raises(TypeError, match="PrepConfig or ContrastLimits"):
+        preview_contrast(_asymmetric_volume(), config={"nope": 1})
+
+
+def test_degenerate_percentiles_do_not_break_the_preview():
+    """A near-uniform frame collapses p90 and p99.9 onto the same value.
+
+    Happens on a nearly empty channel or a z-bin outside the sample. A QC function
+    must render it, not raise.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    from register_embryos.contrast import preview_contrast
+
+    volume = _asymmetric_volume()
+    # A channel that is entirely one value: every percentile is identical.
+    volume.binned_channels[1] = np.full((3, 64, 64), 0.8, np.float32)
+    assert preview_contrast(volume) is not None       # no contrast supplied
+
+
+def test_widen_if_degenerate_behaviour():
+    from register_embryos.contrast import _widen_if_degenerate
+
+    varied = np.linspace(0, 1, 64, dtype=np.float32).reshape(8, 8)
+    # A usable window is returned untouched.
+    assert _widen_if_degenerate(0.1, 0.9, varied) == (0.1, 0.9)
+    # Collapsed percentiles fall back to the array's own range.
+    assert _widen_if_degenerate(0.5, 0.5, varied) == (0.0, 1.0)
+    # A wholly uniform array still yields a nonzero width.
+    flat = np.full((4, 4), 0.8, np.float32)
+    lo, hi = _widen_if_degenerate(0.8, 0.8, flat)
+    assert hi > lo
+
+
+def test_auto_contrast_survives_an_empty_channel():
+    """An all-zero channel must not abort a cohort's automatic contrast."""
+    volume = _volume_with({0: _hcr_like_channel(), 1: np.zeros((8, 160, 160), np.float32)})
+    limits = auto_contrast_limits([volume], verbose=False)
+    lo, hi = limits.get(volume.embryo_id, 1)
+    assert hi > lo
+
+
+# ---------------------------------------------------------------------------
+# Reloading a saved configuration
+# ---------------------------------------------------------------------------
+
+def test_prep_config_round_trips_through_the_cohort_directory(tmp_path):
+    """The notebook's resume path: reopen a cohort and get the same settings back."""
+    from register_embryos.contrast import ContrastLimits
+    from register_embryos.orientation import Orientation, OrientationSet
+    from register_embryos.widgets import PrepConfig
+
+    cohort_dir = tmp_path / "wt_12s_dorsal_20X"
+    original = PrepConfig(
+        orientations=OrientationSet({"e0": Orientation(xy_rotation=155.0, flip_x=True)}),
+        contrast=ContrastLimits.from_dict({"e0": {0: (0.05, 0.4)}}, transform="log2"),
+        orientation_path=cohort_dir / "orientation.json",
+        contrast_path=cohort_dir / "contrast_limits.json",
+    )
+    original.save()
+
+    back = PrepConfig.load(cohort_dir)
+    assert back.orientations.get("e0").xy_rotation == 155.0
+    assert back.orientations.get("e0").flip_x is True
+    assert back.contrast["e0"][0] == (0.05, 0.4)
+    assert back.contrast.transform == "log2"      # or limits get re-applied wrongly
+    # Paths are set, so a reloaded config keeps saving to the same place.
+    assert back.orientation_path == cohort_dir / "orientation.json"
+
+
+def test_prep_config_load_on_a_fresh_directory_is_empty_not_an_error(tmp_path):
+    """The resume cell must be safe to run before anything has been set."""
+    from register_embryos.widgets import PrepConfig
+
+    config = PrepConfig.load(tmp_path / "nothing_here")
+    assert len(config.orientations) == 0
+    assert len(config.contrast) == 0
+
+
+def test_a_reloaded_config_applies_to_volumes(tmp_path):
+    """End of the resume path: reloaded settings must actually drive apply_prep."""
+    from register_embryos.contrast import ContrastLimits, apply_contrast_to_volumes
+    from register_embryos.orientation import (
+        Orientation, OrientationSet, apply_orientation_to_volumes,
+    )
+    from register_embryos.widgets import PrepConfig
+
+    volume = _asymmetric_volume()
+    eid = volume.embryo_id
+    cohort_dir = tmp_path / "cohort"
+    PrepConfig(
+        orientations=OrientationSet({eid: Orientation(xy_rotation=90.0)}),
+        contrast=ContrastLimits.from_dict({eid: {0: (0.05, 0.5), 1: (0.05, 0.5)}}),
+        orientation_path=cohort_dir / "orientation.json",
+        contrast_path=cohort_dir / "contrast_limits.json",
+    ).save()
+
+    reloaded = PrepConfig.load(cohort_dir)
+    oriented = apply_orientation_to_volumes([volume], reloaded.orientations, verbose=False)
+    adjusted = apply_contrast_to_volumes(oriented, reloaded.contrast, verbose=False)
+
+    assert any("oriented" in note for note in adjusted[0].history)
+    assert any("contrast applied" in note for note in adjusted[0].history)
+    for array in adjusted[0].binned_channels.values():
+        assert 0.0 <= array.min() and array.max() <= 1.0
