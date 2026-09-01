@@ -330,13 +330,43 @@ class CohortWorkflow:
         self,
         reference_embryo_id: Optional[str] = None,
         n_downsample: Optional[int] = 5000,
+        trust_orientation: Optional[bool] = None,
+        max_rotation_deg: float = 30.0,
         verbose: bool = True,
         **icp_kwargs,
     ) -> RegistrationResult:
-        """Point-to-point ICP of every embryo onto one reference."""
+        """Point-to-point ICP of every embryo onto one reference.
+
+        Args:
+            trust_orientation: treat the rotation set in the widget as correct and
+                let ICP only refine it -- no PCA re-derivation, rotation about z
+                only, capped at ``max_rotation_deg``. Defaults to True whenever
+                orientations were recorded for this cohort.
+
+                This default exists because the unconstrained fit is actively wrong
+                here: a 12-somite dorsal nucleus cloud is nearly a disc of
+                revolution, so its in-plane angle carries almost no signal, and
+                nearest-neighbour residual scores a 180-degree-flipped fit about as
+                well as a correct one. Anterior-posterior orientation is obvious in
+                the image and was already set from it; re-deriving it from the cloud
+                throws that away.
+            max_rotation_deg: the largest in-plane correction ICP may apply when
+                ``trust_orientation``.
+        """
         if self.combined.empty:
             raise RuntimeError("call build_tables() first")
+
+        if trust_orientation is None:
+            trust_orientation = len(self.orientations) > 0
+        if trust_orientation:
+            icp_kwargs.setdefault("pca_init", False)
+            icp_kwargs.setdefault("inplane_only", True)
+            icp_kwargs.setdefault("max_rotation_deg", max_rotation_deg)
+
         print(f"\n{'='*72}\nREGISTER — {self.cohort.name}\n{'='*72}")
+        if trust_orientation:
+            print(f"  trusting the manual orientation: no PCA re-derivation, "
+                  f"in-plane only, capped at +/-{max_rotation_deg:g} deg")
         self.registration = register_cohort(
             self.results or self.combined,
             reference_embryo_id=reference_embryo_id,

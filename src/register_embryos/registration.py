@@ -29,6 +29,7 @@ from scipy.spatial import cKDTree
 
 __all__ = [
     "HAS_OPEN3D",
+    "rotation_angles",
     "RegistrationResult",
     "isotropic_downsample",
     "pca_align",
@@ -164,6 +165,76 @@ def pca_align(source: np.ndarray, target: np.ndarray) -> np.ndarray:
     return best_transform
 
 
+def rotation_angles(transform: np.ndarray) -> Tuple[float, float]:
+    """``(in_plane_deg, out_of_plane_deg)`` of a 4x4 rigid transform.
+
+    In-plane is rotation about z -- the axis a dorsally-mounted embryo is free to
+    spin around, and the one a near-circular nucleus cloud cannot pin down.
+    """
+    R = transform[:3, :3]
+    in_plane = float(np.degrees(np.arctan2(R[1, 0], R[0, 0])))
+    # How far the z axis is tipped away from vertical.
+    z_axis = R @ np.array([0.0, 0.0, 1.0])
+    out_of_plane = float(np.degrees(np.arccos(np.clip(z_axis[2], -1.0, 1.0))))
+    return in_plane, out_of_plane
+
+
+def _constrain_rotation(
+    transform: np.ndarray,
+    centroid: np.ndarray,
+    max_rotation_deg: Optional[float],
+    inplane_only: bool,
+) -> np.ndarray:
+    """Clamp a transform to the rotation a manually oriented cohort should need.
+
+    Two facts about this data make unconstrained ICP the wrong tool:
+
+    * A 12-somite dorsal nucleus cloud is nearly a disc of revolution -- principal
+      extents about 180 x 155 x 4, an in-plane aspect of only 1.18. The in-plane
+      angle is therefore almost unconstrained by nucleus positions, and mean
+      nearest-neighbour distance barely distinguishes a correct fit from one rotated
+      180 degrees. Optimising that residual will happily flip an embryo end for end.
+    * The anterior-posterior orientation is not actually unknown. It was set by eye
+      in the widget, from the image, where it is obvious. Letting ICP re-derive it
+      from a symmetric cloud discards better information than it has.
+
+    So the rotation is capped, and optionally restricted to the z axis: out-of-plane
+    tilt is even less constrained (the cloud is ~4 units thick against ~180 wide) and
+    a large one is always fitting noise.
+    """
+    if max_rotation_deg is None and not inplane_only:
+        return transform
+
+    R = transform[:3, :3]
+    if inplane_only:
+        angle = np.arctan2(R[1, 0], R[0, 0])
+        R = np.array([[np.cos(angle), -np.sin(angle), 0.0],
+                      [np.sin(angle), np.cos(angle), 0.0],
+                      [0.0, 0.0, 1.0]])
+
+    if max_rotation_deg is not None:
+        angle = np.arctan2(R[1, 0], R[0, 0])
+        cap = np.radians(max_rotation_deg)
+        if abs(angle) > cap:
+            angle = np.sign(angle) * cap
+            R = np.array([[np.cos(angle), -np.sin(angle), 0.0],
+                          [np.sin(angle), np.cos(angle), 0.0],
+                          [0.0, 0.0, 1.0]])
+        elif not inplane_only:
+            _, out_of_plane = rotation_angles(transform)
+            if out_of_plane > max_rotation_deg:
+                R = np.array([[np.cos(angle), -np.sin(angle), 0.0],
+                              [np.sin(angle), np.cos(angle), 0.0],
+                              [0.0, 0.0, 1.0]])
+
+    # Recover the translation that keeps the clamped rotation centred the same way.
+    constrained = np.eye(4)
+    constrained[:3, :3] = R
+    original_centre = _apply_transform(centroid[None, :], transform)[0]
+    constrained[:3, 3] = original_centre - R @ centroid
+    return constrained
+
+
 def _apply_transform(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
     return (transform[:3, :3] @ points.T).T + transform[:3, 3]
 
@@ -254,6 +325,8 @@ def icp_point_to_point(
     relative_rmse: float = 1e-6,
     tolerance: float = 1e-7,
     pca_init: bool = True,
+    max_rotation_deg: Optional[float] = None,
+    inplane_only: bool = False,
     backend: str = "auto",
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Register ``source`` onto ``target``; returns ``(transformed, transform4x4)``.
@@ -264,8 +337,17 @@ def icp_point_to_point(
             calibrated to a 1024x1024 frame.  Too small and ICP has nothing to
             latch onto before the coarse alignment finishes the job; too large
             and it will happily pair unrelated regions.
-        pca_init: PCA coarse alignment before ICP.  Leave on unless the clouds
-            are already roughly aligned.
+        pca_init: PCA coarse alignment before ICP.  **Turn this off when the
+            embryos have already been oriented by hand.** PCA derives the axes from
+            the nucleus cloud, which for a dorsal embryo is nearly circular in plane
+            (aspect ~1.18), so its answer is close to arbitrary -- and it will
+            happily overwrite a correct manual orientation with a 180 degree flip.
+        max_rotation_deg: cap the in-plane rotation ICP may apply.  With a manually
+            oriented cohort this is the parameter that matters: it stops the fit
+            wandering off an orientation that was set from the image, where anterior
+            is obvious, using a cloud where it is not.
+        inplane_only: restrict rotation to the z axis.  Out-of-plane tilt is
+            essentially unconstrained for a cloud ~4 units thick and ~180 wide.
         backend: ``"auto"``, ``"open3d"`` or ``"numpy"``.
     """
     if len(source) < 3 or len(target) < 3:
@@ -294,6 +376,9 @@ def icp_point_to_point(
             max_correspondence_distance, max_iteration, tolerance,
         ) @ init
 
+    transform = _constrain_rotation(
+        transform, source.mean(axis=0), max_rotation_deg, inplane_only
+    )
     return _apply_transform(source, transform), transform
 
 
@@ -369,6 +454,12 @@ def register_frames(
 ) -> RegistrationResult:
     """Register a dict of ``embryo_id -> nucleus table`` onto one reference.
 
+    For a cohort whose embryos were oriented by hand, pass
+    ``pca_init=False, inplane_only=True, max_rotation_deg=30``. See
+    :func:`icp_point_to_point` for why: the nucleus cloud of a dorsal embryo is
+    nearly circular in plane, so nothing in it pins the anterior-posterior angle,
+    and an unconstrained fit will overwrite a correct manual orientation.
+
     Args:
         n_downsample: isotropic downsample applied per embryo before ICP.  Set
             ``None`` to register the full clouds (slower, rarely better -- ICP on
@@ -434,6 +525,17 @@ def register_frames(
         out[["x_reg", "y_reg", "z_reg"]] = transformed
         registered_frames.append(out)
         transforms[embryo_id] = transform
+
+        if verbose and embryo_id != reference_embryo_id:
+            in_plane, out_of_plane = rotation_angles(transform)
+            flag = ""
+            if abs(in_plane) > 90:
+                flag = ("   <- WARNING: this reverses anterior-posterior. If the "
+                        "cohort was oriented by hand, this is ICP overriding it.")
+            elif abs(in_plane) > 30:
+                flag = "   <- large in-plane correction; check it against the image"
+            print(f"    [ROT] {embryo_id}: in-plane {in_plane:+.1f} deg, "
+                  f"tilt {out_of_plane:.1f} deg{flag}")
 
     registered = (
         pd.concat(registered_frames, ignore_index=True) if registered_frames else pd.DataFrame()

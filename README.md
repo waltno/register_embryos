@@ -227,6 +227,22 @@ keeps dense regions dense, and ICP then fits the dense regions and ignores the
 sparse ones. `isotropic_downsample` normalises each axis to [0,1] first, so z (a
 few dozen bins) is weighted like x and y (a thousand pixels).
 
+**Why registration trusts your manual orientation.** A 12-somite dorsal nucleus
+cloud is nearly a disc of revolution — measured on a real cohort, principal extents
+of ~180 × 155 × 4, an in-plane aspect of only **1.18**. Nothing in the nucleus
+positions pins down the anterior–posterior angle, and mean nearest-neighbour distance
+scores a 180°-flipped fit about as well as a correct one (7.40 vs 7.38 px on that
+cohort — indistinguishable). Left unconstrained, ICP flipped three of seven embryos
+end-for-end and tilted a fourth by 31°, silently destroying the orientation that had
+been set by eye in the widget, where anterior is obvious.
+
+So `CohortWorkflow.register()` defaults to `trust_orientation=True` whenever
+orientations were recorded: no PCA re-derivation, rotation about z only, capped at
+±30°. Judged on gene-domain agreement — which nucleus positions cannot provide,
+because positions are near-symmetric and expression domains are not — that cut the
+cohort spread for wt1a from 69 → 43 px and tbx1 from 118 → 65 px. The applied
+in-plane rotation is printed per embryo, and anything beyond 90° is flagged.
+
 **Why residuals are reported with one metric.** Mean nearest-neighbour distance
 compared against RMS nearest-neighbour distance makes a good fit look like a
 regression, because RMS of a positive quantity always exceeds its mean.

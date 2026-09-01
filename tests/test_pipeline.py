@@ -945,3 +945,143 @@ def test_the_recorded_mode_distinguishes_the_three():
     for mode in ("2d", "2d+link", "3d"):
         result = build_nucleus_table(_segmented(mode), save=False, verbose=False)
         assert result.mode == mode
+
+
+# ---------------------------------------------------------------------------
+# Constrained registration: a near-circular cloud cannot pin down its own angle
+# ---------------------------------------------------------------------------
+
+def _disc_cloud(n=1500, seed=0):
+    """A flat, nearly circular cloud, like a 12-somite dorsal embryo.
+
+    Real cohort geometry: principal extents ~180 x 155 x 4, an in-plane aspect of
+    only 1.18. That near-symmetry is why nucleus positions cannot fix the
+    anterior-posterior angle.
+    """
+    rng = np.random.default_rng(seed)
+    return rng.normal(0, 1, (n, 3)) * np.array([180.0, 155.0, 4.0])
+
+
+def _z_rotation(degrees):
+    theta = np.radians(degrees)
+    matrix = np.eye(4)
+    matrix[:3, :3] = [[np.cos(theta), -np.sin(theta), 0],
+                      [np.sin(theta), np.cos(theta), 0],
+                      [0, 0, 1]]
+    return matrix
+
+
+def test_rotation_angles_decomposes_a_transform():
+    from register_embryos.registration import rotation_angles
+
+    in_plane, tilt = rotation_angles(_z_rotation(172.4))
+    assert in_plane == pytest.approx(172.4, abs=0.1)
+    assert tilt == pytest.approx(0.0, abs=1e-6)
+
+
+def test_nn_residual_cannot_tell_a_180_degree_flip_from_a_correct_fit():
+    """The reason a residual-driven fit goes wrong on this geometry.
+
+    A near-circular disc looks almost the same rotated end for end, so optimising
+    nearest-neighbour distance gives no reason to prefer the correct orientation.
+    """
+    from scipy.spatial import cKDTree
+
+    cloud = _disc_cloud()
+    tree = cKDTree(cloud)
+    upright = tree.query(cloud)[0].mean()
+    flipped = tree.query(_apply(cloud, _z_rotation(180.0)))[0].mean()
+    # Within a factor of two -- nowhere near enough to identify the right pose.
+    assert flipped < upright + 12.0
+
+
+def _apply(points, transform):
+    return (transform[:3, :3] @ points.T).T + transform[:3, 3]
+
+
+def test_max_rotation_caps_the_in_plane_correction():
+    from register_embryos.registration import icp_point_to_point, rotation_angles
+
+    target = _disc_cloud(seed=1)
+    source = _apply(target, _z_rotation(170.0))     # grossly mis-oriented input
+
+    _, unconstrained = icp_point_to_point(
+        source, target, max_correspondence_distance=500, max_iteration=100
+    )
+    _, capped = icp_point_to_point(
+        source, target, max_correspondence_distance=500, max_iteration=100,
+        pca_init=False, inplane_only=True, max_rotation_deg=30.0,
+    )
+    assert abs(rotation_angles(capped)[0]) <= 30.0 + 1e-6
+    # The cap is doing something: unconstrained is free to swing much further.
+    assert abs(rotation_angles(capped)[0]) < abs(rotation_angles(unconstrained)[0]) + 1e-6
+
+
+def test_inplane_only_removes_out_of_plane_tilt():
+    """A cloud ~4 units thick against ~180 wide cannot constrain tilt."""
+    from register_embryos.registration import icp_point_to_point, rotation_angles
+
+    target = _disc_cloud(seed=2)
+    source = _apply(target, _z_rotation(15.0)) + np.array([30.0, -20.0, 1.0])
+    _, transform = icp_point_to_point(
+        source, target, max_correspondence_distance=500, pca_init=False,
+        inplane_only=True,
+    )
+    assert rotation_angles(transform)[1] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_constrained_fit_still_recovers_a_small_misalignment():
+    """Capping rotation must not stop ICP doing its actual job."""
+    from scipy.spatial import cKDTree
+
+    from register_embryos.registration import icp_point_to_point
+
+    target = _disc_cloud(seed=3)
+    source = _apply(target, _z_rotation(12.0)) + np.array([40.0, 25.0, 2.0])
+    registered, _ = icp_point_to_point(
+        source, target, max_correspondence_distance=500, pca_init=False,
+        inplane_only=True, max_rotation_deg=30.0,
+    )
+    tree = cKDTree(target)
+    assert tree.query(registered)[0].mean() < tree.query(source)[0].mean() * 0.5
+
+
+def test_workflow_register_trusts_a_manual_orientation_by_default(tmp_path):
+    """If orientations were recorded, ICP must not re-derive them from the cloud."""
+    from register_embryos.naming import CohortKey, parse_embryo_name
+    from register_embryos.orientation import Orientation, OrientationSet
+    from register_embryos.registration import rotation_angles
+    from register_embryos.workflow import CohortWorkflow
+
+    embryo = parse_embryo_name("20260410_1.5_wt_12s_dorsal_20X_a_b_c.nd2")
+    wf = CohortWorkflow(CohortKey("wt", "12s", "dorsal", "20X"), [embryo], tmp_path)
+
+    target = _disc_cloud(seed=4)
+    source = _apply(target, _z_rotation(170.0))
+    frames = []
+    for name, cloud in (("ref", target), ("mov", source)):
+        df = pd.DataFrame(cloud, columns=["x", "y", "z"])
+        df["embryo_id"] = name
+        df["geneA"] = 0.5
+        frames.append(df)
+    wf.combined = pd.concat(frames, ignore_index=True)
+    wf.orientations = OrientationSet({"mov": Orientation(xy_rotation=170.0)})
+
+    result = wf.register(reference_embryo_id="ref", n_downsample=None, verbose=False)
+    in_plane, tilt = rotation_angles(result.transform_of("mov"))
+    assert abs(in_plane) <= 30.0 + 1e-6      # capped, not flipped
+    assert tilt == pytest.approx(0.0, abs=1e-6)
+
+
+def test_trust_orientation_can_be_turned_off():
+    from register_embryos.registration import register_frames, rotation_angles
+
+    target = _disc_cloud(seed=5)
+    source = _apply(target, _z_rotation(170.0))
+    frames = {
+        "ref": pd.DataFrame(target, columns=["x", "y", "z"]).assign(embryo_id="ref"),
+        "mov": pd.DataFrame(source, columns=["x", "y", "z"]).assign(embryo_id="mov"),
+    }
+    result = register_frames(frames, reference_embryo_id="ref", n_downsample=None,
+                            verbose=False)   # unconstrained, the old behaviour
+    assert abs(rotation_angles(result.transform_of("mov"))[0]) > 30.0
