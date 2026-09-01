@@ -1378,3 +1378,56 @@ def test_unknown_signal_mask_mode_is_rejected():
     with pytest.raises(ValueError, match="unknown signal_mask_mode"):
         _apply_background({1: np.zeros((1, 2, 2), np.float32)},
                           np.ones((1, 2, 2), dtype=bool), mode="intersection")
+
+
+def test_reload_segmentation_uses_masks_from_disk(tmp_path):
+    """The fast path: new gene contrast, same masks, no Cellpose."""
+    from register_embryos.naming import CohortKey, parse_embryo_name
+    from register_embryos.workflow import CohortWorkflow
+
+    volume = _asymmetric_volume()
+    cohort = CohortKey("wt", "12s", "dorsal", "20X")
+    wf = CohortWorkflow(cohort, [volume.name], tmp_path)
+    wf.volumes = [volume]
+    wf.adjusted = [volume]
+
+    embryo_dir = wf.output_dir / "embryos" / volume.embryo_id
+    embryo_dir.mkdir(parents=True, exist_ok=True)
+    masks = np.zeros((3, 64, 64), dtype=int)
+    masks[:, 10:20, 10:20] = 1
+    np.save(embryo_dir / f"{volume.embryo_id}_nuclear_masks.npy", masks)
+
+    segmented = wf.reload_segmentation(verbose=False)
+    assert len(segmented) == 1
+    assert np.array_equal(segmented[0].nuclear_masks, masks)
+    assert segmented[0].params["reloaded"] is True
+    assert wf.segmented == segmented
+
+
+def test_reload_segmentation_reports_missing_masks(tmp_path):
+    from register_embryos.naming import CohortKey
+    from register_embryos.workflow import CohortWorkflow
+
+    volume = _asymmetric_volume()
+    wf = CohortWorkflow(CohortKey("wt", "12s", "dorsal", "20X"), [volume.name], tmp_path)
+    wf.volumes = [volume]
+    wf.adjusted = [volume]
+    with pytest.raises(FileNotFoundError, match="no saved masks"):
+        wf.reload_segmentation(verbose=False)
+
+
+def test_reload_segmentation_refuses_mismatched_masks(tmp_path):
+    """A different bin_size or a resized canvas makes the masks describe another image."""
+    from register_embryos.naming import CohortKey
+    from register_embryos.workflow import CohortWorkflow
+
+    volume = _asymmetric_volume()                      # (3, 64, 64)
+    wf = CohortWorkflow(CohortKey("wt", "12s", "dorsal", "20X"), [volume.name], tmp_path)
+    wf.volumes = [volume]
+    wf.adjusted = [volume]
+    embryo_dir = wf.output_dir / "embryos" / volume.embryo_id
+    embryo_dir.mkdir(parents=True, exist_ok=True)
+    np.save(embryo_dir / f"{volume.embryo_id}_nuclear_masks.npy",
+            np.zeros((3, 32, 32), dtype=int))          # wrong shape
+    with pytest.raises(ValueError, match="cannot be reused"):
+        wf.reload_segmentation(verbose=False)

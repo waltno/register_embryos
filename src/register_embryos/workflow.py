@@ -40,7 +40,7 @@ from .imaging import EmbryoVolume, load_cohort
 from .naming import CohortKey, EmbryoName, discover_embryos, group_into_cohorts
 from .orientation import OrientationSet, apply_orientation_to_volumes
 from .registration import RegistrationResult, register_cohort
-from .segmentation import SegmentedEmbryo, segment_cohort
+from .segmentation import SegmentedEmbryo, load_segmented, segment_cohort
 
 __all__ = [
     "CohortWorkflow", "CohortOutputs", "run_cohort", "run_all_cohorts", "scan",
@@ -311,6 +311,55 @@ class CohortWorkflow:
         )
         self._params.update({"segmentation_mode": mode, "diameter": diameter})
         return self.segmented
+
+    def reload_segmentation(self, verbose: bool = True) -> List[SegmentedEmbryo]:
+        """Take the nuclear masks off disk instead of re-running Cellpose.
+
+        Use this in place of :meth:`segment` when only the **gene** contrast has
+        changed. Cellpose only ever looks at channel 0, so a new window on a gene
+        channel leaves the masks valid -- what changes is the signal mask, the pixel
+        assignment and the per-nucleus means, all of which are minutes of work rather
+        than hours.
+
+        Call it after :meth:`apply_prep`, so the reloaded masks are paired with the
+        newly contrasted volumes. Refuses masks whose shape or bin size no longer
+        matches, since a different z sampling or a canvas-resizing rotation makes them
+        describe a different image.
+
+        Raises:
+            FileNotFoundError: if a cohort embryo has no saved masks.
+        """
+        volumes = self.adjusted or self.volumes
+        if not volumes:
+            raise RuntimeError("call load() (and usually apply_prep()) first")
+        if not self.adjusted:
+            print("  [NOTE] pairing masks with un-adjusted volumes; "
+                  "apply_prep() was not run")
+
+        print(f"\n{'='*72}\nRELOAD SEGMENTATION — {self.cohort.name}\n{'='*72}")
+        print("  Cellpose is not re-run; only the gene channels are re-measured.")
+
+        segmented: List[SegmentedEmbryo] = []
+        missing: List[str] = []
+        for volume in volumes:
+            embryo_dir = self.output_dir / "embryos" / volume.embryo_id
+            try:
+                segmented.append(load_segmented(embryo_dir, volume, verbose=verbose))
+            except FileNotFoundError:
+                missing.append(volume.embryo_id)
+
+        if missing:
+            raise FileNotFoundError(
+                f"no saved masks for {len(missing)} embryo(s) under "
+                f"{self.output_dir / 'embryos'}: {missing}. Run segment() for those, "
+                f"or point output_root at the run that produced them."
+            )
+
+        self.segmented = segmented
+        if segmented:
+            self._params["segmentation_mode"] = segmented[0].mode
+            self._params["masks_reloaded"] = True
+        return segmented
 
     def build_tables(
         self, signal_threshold: float = 0.05, verbose: bool = True, **kwargs
