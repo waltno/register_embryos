@@ -7,6 +7,8 @@ intensity stays on the same scale as the per-embryo intensity it came from, and 
 only the genes a nucleus is positive for tint it.
 """
 
+import json
+
 import matplotlib
 import numpy as np
 import pandas as pd
@@ -582,3 +584,55 @@ def test_load_tables_recovers_the_orientations_that_gate_the_cap(tmp_path):
     assert len(wf.orientations) == 0
     wf.load_tables(cohort_dir, verbose=False)
     assert len(wf.orientations) == 2
+
+
+# -- masks must not outlive the orientation they were made at ------------------
+
+def _volume(embryo_id="e0", orientation="identity", shape=(2, 8, 8)):
+    from register_embryos.imaging import EmbryoVolume, VoxelSize
+    from register_embryos.naming import EmbryoName
+
+    name = EmbryoName(
+        date="20260101", embryo_num="1.1", genotype="wt", timepoint="12s",
+        view="dorsal", magnification="20X", channels=("hand2",), path=None,
+    )
+    return EmbryoVolume(
+        name=name,
+        binned_channels={0: np.zeros(shape, dtype=np.float32),
+                         1: np.zeros(shape, dtype=np.float32)},
+        voxel=VoxelSize(xy_um=0.86, z_um=1.5), bin_size=7, c_size=2, z_size=14,
+        orientation=orientation,
+    )
+
+
+def test_masks_from_a_different_rotation_are_refused(tmp_path):
+    """A rotation in a fixed canvas leaves the shape identical, so shape cannot tell."""
+    from register_embryos.segmentation import load_segmented
+
+    volume = _volume(orientation="xy 153 deg")
+    embryo_dir = tmp_path / volume.embryo_id
+    embryo_dir.mkdir(parents=True)
+    np.save(embryo_dir / f"{volume.embryo_id}_nuclear_masks.npy",
+            np.zeros((2, 8, 8), dtype=int))
+    (embryo_dir / f"{volume.embryo_id}_gene_map.json").write_text(json.dumps({
+        "gene_map": {"1": "hand2"}, "mode": "2d+link", "anisotropy": 1.0,
+        "bin_size": 7, "orientation": "xy 29 deg, flip x",
+    }))
+
+    with pytest.raises(ValueError, match="does not change the array shape"):
+        load_segmented(embryo_dir, volume, verbose=False)
+
+    # Same masks, matching orientation: fine.
+    matching = _volume(orientation="xy 29 deg, flip x")
+    assert load_segmented(embryo_dir, matching, verbose=False).mode == "2d+link"
+
+
+def test_apply_orientation_stamps_what_it_did():
+    from register_embryos.orientation import Orientation, apply_orientation
+
+    volume = _volume()
+    assert volume.orientation == "identity"
+    rotated = apply_orientation(volume, Orientation(xy_rotation=30.0), verbose=False)
+    assert rotated.orientation == Orientation(xy_rotation=30.0).describe()
+    # An identity orientation returns the volume untouched, so the stamp stays.
+    assert apply_orientation(volume, Orientation(), verbose=False).orientation == "identity"

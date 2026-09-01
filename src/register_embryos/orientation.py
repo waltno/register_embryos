@@ -277,7 +277,10 @@ def apply_orientation(
         else:
             print(f"  [ORIENT] {volume.embryo_id}: {orientation.describe()}")
 
-    return volume.replace_channels(channels, note=f"oriented ({orientation.describe()})")
+    return volume.replace_channels(
+        channels, note=f"oriented ({orientation.describe()})",
+        orientation=orientation.describe(),
+    )
 
 
 def apply_orientation_to_volumes(

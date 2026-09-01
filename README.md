@@ -164,8 +164,11 @@ wf.reload_segmentation(masks_from="…/data/hcr/20260831/wt_12s_dorsal_20X")
 register-embryos run <nd2_dir> -o <out> --masks-from <previous run>
 ```
 
-The run root, the cohort dir and its `embryos/` dir all resolve. A mask whose shape
-or bin size no longer matches is refused rather than combined.
+The run root, the cohort dir and its `embryos/` dir all resolve. A mask whose shape,
+bin size or **orientation** no longer matches is refused rather than combined — the
+orientation check matters because Cellpose runs after rotation, and rotating inside a
+fixed canvas leaves the array shape identical, so nothing else would catch it. Change
+a rotation and you must re-segment; `reload_segmentation` is for gene contrast only.
 
 **Resume without images at all.** Registration, the atlas and every figure need only
 the nucleus table, so on a fresh kernel skip straight past loading and segmentation:

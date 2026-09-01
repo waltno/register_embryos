@@ -106,6 +106,12 @@ class EmbryoVolume:
     channel_names: Tuple[str, ...] = ()
     stack_zcyx: Optional[np.ndarray] = None
     history: List[str] = field(default_factory=list)
+    #: The orientation these channels were rotated into, as
+    #: :meth:`~register_embryos.orientation.Orientation.describe` renders it, or
+    #: ``"identity"``.  Carried explicitly because a rotation inside a fixed canvas
+    #: leaves the array *shape* untouched: saved masks from a different rotation
+    #: would pass every other compatibility check and be silently wrong.
+    orientation: str = "identity"
 
     @property
     def embryo_id(self) -> str:
@@ -138,7 +144,8 @@ class EmbryoVolume:
         return self
 
     def replace_channels(
-        self, channels: Dict[int, np.ndarray], note: str = ""
+        self, channels: Dict[int, np.ndarray], note: str = "",
+        orientation: Optional[str] = None,
     ) -> "EmbryoVolume":
         """A copy carrying new channel arrays, keeping identity and geometry."""
         return EmbryoVolume(
@@ -151,6 +158,7 @@ class EmbryoVolume:
             channel_names=self.channel_names,
             stack_zcyx=self.stack_zcyx,
             history=[*self.history, note] if note else list(self.history),
+            orientation=self.orientation if orientation is None else orientation,
         )
 
 

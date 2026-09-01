@@ -503,6 +503,7 @@ def segment_embryo(
                     "mode": mode,
                     "anisotropy": resolved_anisotropy,
                     "bin_size": volume.bin_size,
+                    "orientation": volume.orientation,
                     "voxel_um": {"xy": volume.voxel.xy_um, "z": volume.voxel.z_um},
                 },
                 fh,
@@ -569,6 +570,19 @@ def load_segmented(
             meta = json.load(handle)
         mode = meta.get("mode", mode)
         anisotropy = meta.get("anisotropy", anisotropy)
+        saved_orientation = meta.get("orientation")
+        if saved_orientation is not None and saved_orientation != volume.orientation:
+            # The shape check below cannot catch this: rotating inside a fixed canvas
+            # leaves the array exactly the same size, so old masks would line up
+            # numerically while describing a differently rotated embryo.
+            raise ValueError(
+                f"{volume.embryo_id}: masks were segmented at orientation "
+                f"{saved_orientation!r} but this volume is {volume.orientation!r}. "
+                f"A rotation inside a fixed canvas does not change the array shape, "
+                f"so these masks would silently be wrong. Re-run segment() for this "
+                f"cohort, or reload the orientation the masks were made with."
+            )
+
         saved_bin = meta.get("bin_size")
         if saved_bin is not None and saved_bin != volume.bin_size:
             print(
