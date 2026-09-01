@@ -121,6 +121,14 @@ from .registration import (
     register_cohort,
     register_frames,
 )
+from .thresholds import (
+    ThresholdResult,
+    apply_thresholds,
+    call_thresholds,
+    otsu_threshold,
+    plot_threshold_diagnostics,
+    threshold_sweep,
+)
 from .segmentation import (
     SegmentedEmbryo,
     relabel_3d_from_2d,
@@ -161,6 +169,9 @@ __all__ = [
     "icp_point_to_point", "icp_residuals", "register_cohort", "register_frames",
     # atlas
     "Atlas", "build_atlas", "atlas_diagnostics", "align_atlases",
+    # thresholds
+    "ThresholdResult", "call_thresholds", "apply_thresholds",
+    "otsu_threshold", "threshold_sweep", "plot_threshold_diagnostics",
     # plotting
     "Theme", "DARK", "LIGHT", "theme_for", "GENE_RGB", "additive_style",
     "plot_pointcloud_3d", "plot_additive_3d", "plot_additive_2d",

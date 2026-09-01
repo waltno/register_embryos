@@ -422,16 +422,31 @@ def preview_contrast(
     for row, channel in enumerate(channel_list):
         data = _transform_array(volume.binned_channels[channel], resolved_transform)
 
-        # Same order the widget and apply_orientation use: flips, then rotation.
+        # Same order and same staging as apply_orientation: flips on the volume,
+        # then rotation per plane, and only then the projection. Rotating a max
+        # projection instead gives a visibly different image, because rotation
+        # interpolates -- so the preview would not be what gets segmented.
         if resolved_orientation.flip_z:
             data = data[::-1]
-        frame = data.max(axis=0) if max_projection else data[min(z_index, data.shape[0] - 1)]
         if resolved_orientation.flip_y:
-            frame = frame[::-1, :]
+            data = data[:, ::-1]
         if resolved_orientation.flip_x:
-            frame = frame[:, ::-1]
-        if resolved_orientation.xy_rotation % 360:
-            frame = rotate_frame(frame, resolved_orientation.xy_rotation, resize=resize)
+            data = data[:, :, ::-1]
+
+        angle = resolved_orientation.xy_rotation
+        if angle % 360:
+            if max_projection:
+                data = np.stack([
+                    rotate_frame(data[z], angle, resize=resize)
+                    for z in range(data.shape[0])
+                ])
+                frame = data.max(axis=0)
+            else:
+                frame = rotate_frame(
+                    data[min(z_index, data.shape[0] - 1)], angle, resize=resize
+                )
+        else:
+            frame = data.max(axis=0) if max_projection else data[min(z_index, data.shape[0] - 1)]
 
         if resolved_contrast is not None and volume.embryo_id in resolved_contrast:
             limits = resolved_contrast.get(volume.embryo_id, channel)

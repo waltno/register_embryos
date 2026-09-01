@@ -180,7 +180,7 @@ def additive_style(
     mode: str = "dark",
     gamma: float = 0.35,
     quantile_clip: float = 0.95,
-    threshold: float = INTENSITY_THRESH,
+    threshold=INTENSITY_THRESH,
     size_range: Tuple[float, float] = (1.0, 14.0),
     alpha_low: float = 0.15,
 ) -> Dict[str, object]:
@@ -191,10 +191,15 @@ def additive_style(
     black; total intensity drives size and opacity instead.  Separating hue from
     brightness is what keeps a three-colour overlay readable.
 
-    A nucleus counts as expressing when at least ONE channel clears
+    A nucleus counts as expressing when at least ONE channel clears its
     ``threshold``.  Not the channel sum: summing lets a nucleus with three
     sub-threshold channels look positive while being positive for nothing, so
     "coloured" and "positive for some gene" would stop agreeing.
+
+    ``threshold`` may be a single number or a ``{gene: cut}`` mapping -- the
+    data-driven cuts from :mod:`register_embryos.thresholds` differ per gene and per
+    embryo, and a fixed 0.05 on contrast-normalised intensity means a different
+    brightness in every embryo.
 
     Args:
         gamma: < 1 lifts dim nuclei.  0.35 is a moderate lift; the original
@@ -231,7 +236,14 @@ def additive_style(
     peak = clipped.max(axis=1, keepdims=True)
     bright = clipped / np.where(peak > 1e-9, peak, 1.0)
 
-    hi_mask = (values >= threshold).any(axis=1)
+    # threshold may be one number for every gene, or a per-gene mapping -- the
+    # data-driven cuts from register_embryos.thresholds differ per gene, and a
+    # single number cannot express that.
+    if isinstance(threshold, dict):
+        cuts = np.array([float(threshold.get(g, INTENSITY_THRESH)) for g in gene_list])
+    else:
+        cuts = np.full(len(gene_list), float(threshold))
+    hi_mask = (values >= cuts[None, :]).any(axis=1)
     rgb = np.where(hi_mask[:, None], bright, theme.silent_rgb[None, :])
     size_min, size_max = size_range
 
@@ -516,86 +528,131 @@ def _save_fig(fig, theme: Theme, save_path: Optional[str | Path]) -> Optional[Pa
 
 def plot_additive_2d(
     frames,
+    coord_sets: Optional[Sequence[Tuple[str, str, str]]] = None,
+    style_of=None,
     mode: str = "dark",
     genes: Optional[Sequence[str]] = None,
     coords: Optional[Sequence[str]] = None,
     suptitle: str = "",
-    size_scale: float = 1.6,
+    size_scale: float = 2.0,
+    stroke_color: str = "black",
+    stroke_width: float = 0.3,
+    silent_alpha: float = 0.85,
+    silent_stroke_alpha: float = 0.4,
+    colored_stroke_alpha: float = 1.0,
     save_path: Optional[str | Path] = None,
-    panel_size: float = 4.2,
+    panel_size: float = 5.0,
     z_aspect: Optional[float] = None,
     **style_kwargs,
 ):
-    """Additive overlay as XY/XZ/YZ projections, one row per frame.
+    """Additive-overlay projections, one row per entry in ``frames``.
 
     Args:
-        frames: a dataframe, or ``[(label, dataframe), ...]`` for one row each --
+        frames: a dataframe, or ``[(row_label, dataframe), ...]`` for one row each --
             the shape to use for stacking per-embryo rows or comparing atlases.
-        z_aspect: xy pixels per z step (the voxel anisotropy), so the XZ/YZ panels
-            are drawn in true proportion.  Without it they autoscale -- x is in
-            pixels and z in bin indices, and forcing equal aspect across those two
-            makes the embryo look flat.
+        coord_sets: ``[(cx, cy, panel_label), ...]`` column triples. Defaults to the
+            XY/XZ/YZ projections of whichever coordinate set is present.
+        style_of: precomputed :func:`additive_style` output -- a dict keyed by row
+            label, or a single style dict. Pass this to style several figures
+            identically (so colours and dot sizes are comparable between them);
+            omit it and each row is styled from its own data.
+        stroke_color / stroke_width: outline drawn around every nucleus. A thin
+            outline is what keeps overlapping dim nuclei countable rather than
+            merging into a wash.
+        silent_alpha: fill opacity for below-threshold (grey) nuclei.
+        silent_stroke_alpha / colored_stroke_alpha: outline opacity per layer.
+            Silent nuclei keep a solid-ish outline so they read as tissue context;
+            expressing nuclei get a soft one so the fill colour dominates.
+        z_aspect: xy pixels per z step, so XZ/YZ are drawn in true proportion.
+
+    Colours, sizes and opacities are written as explicit per-point RGBA arrays rather
+    than passed as scalar ``alpha=``: a scalar would apply one opacity to the whole
+    layer, and the point of the silent/expressing split is that they differ.
     """
     import matplotlib
+    import matplotlib.patches as mpatches
     import matplotlib.pyplot as plt
 
     matplotlib.rcParams["pdf.fonttype"] = 42
     matplotlib.rcParams["ps.fonttype"] = 42
 
     theme = theme_for(mode)
+    dark = theme.is_dark
+
+    # Accept a bare dataframe (+ a bare style dict) for the single-atlas case.
     if isinstance(frames, pd.DataFrame):
         frames = [("", frames)]
+        if style_of is not None and not isinstance(style_of, dict):
+            style_of = {"": style_of}
+        elif isinstance(style_of, dict) and "rgb" in style_of:
+            style_of = {"": style_of}
     frame_list = list(frames)
 
     first = frame_list[0][1]
-    coord_cols = _resolve_coords(first, coords)
-    projections = _projection_cols(coord_cols)
-    hexes = gene_hex(_resolve_genes(first, genes))
+    if coord_sets is None:
+        coord_sets = _projection_cols(_resolve_coords(first, coords))
+    gene_list = _resolve_genes(first, genes)
+    hexes = gene_hex(gene_list)
+    stroke_rgb = matplotlib.colors.to_rgb(stroke_color)
 
     fig, axes = plt.subplots(
-        len(frame_list), len(projections),
-        figsize=(panel_size * len(projections), panel_size * len(frame_list)),
+        len(frame_list), len(coord_sets),
+        figsize=(panel_size * len(coord_sets), panel_size * len(frame_list)),
         facecolor=theme.paper, squeeze=False,
     )
-    for row, (label, df) in enumerate(frame_list):
-        st = additive_style(df, genes, mode=mode, **style_kwargs)
+
+    for row, (row_label, df) in enumerate(frame_list):
+        if style_of is not None:
+            st = style_of[row_label] if isinstance(style_of, dict) else style_of
+        else:
+            st = additive_style(df, genes, mode=mode, **style_kwargs)
         rgb = np.asarray(st["rgb"])
         sizes = np.asarray(st["sizes"]) * size_scale
         hi = np.asarray(st["hi_mask"])
 
-        for column, (cx, cy, panel) in enumerate(projections):
-            ax = axes[row][column]
-            # Silent first (translucent) so expressing nuclei on top are never
-            # hidden behind the grey background layer.
-            # Positional indexing throughout: the style arrays are positional, and
-            # a frame sliced out of a concatenated table keeps its original labels,
-            # so .loc with positional integers raises (or worse, silently
-            # mismatches rows against their colours).
-            x_all = df[cx].to_numpy()
-            y_all = df[cy].to_numpy()
-            for mask, alpha, stroke_alpha in ((~hi, 0.55, 0.35), (hi, 1.0, 0.9)):
-                if not mask.any():
+        # Silent first (translucent) so expressing nuclei, drawn opaque on top, are
+        # never occluded by the grey background layer.
+        layers = [(~hi, silent_alpha, silent_stroke_alpha),
+                  (hi, 1.0, colored_stroke_alpha)]
+
+        for col, (cx, cy, panel) in enumerate(coord_sets):
+            ax = axes[row][col]
+            ax.set_facecolor(theme.paper)
+            # Positional throughout: the style arrays are positional, and a frame
+            # sliced out of a concatenated table keeps its original labels.
+            xv, yv = df[cx].to_numpy(), df[cy].to_numpy()
+
+            for mask, fill_alpha, stroke_alpha in layers:
+                k = int(mask.sum())
+                if not k:
                     continue
-                ax.scatter(
-                    x_all[mask], y_all[mask],
-                    c=rgb[mask], s=sizes[mask], alpha=alpha,
-                    linewidths=0.25,
-                    edgecolors=matplotlib.colors.to_rgba(theme.stroke, stroke_alpha),
-                    rasterized=True,
-                )
-            title = f"{label} — {panel}" if label else panel
+                face = np.column_stack([rgb[mask], np.full(k, fill_alpha)])
+                edge = np.column_stack([np.tile(stroke_rgb, (k, 1)),
+                                        np.full(k, stroke_alpha)])
+                ax.scatter(xv[mask], yv[mask], c=face, s=sizes[mask],
+                           edgecolors=edge, linewidths=stroke_width,
+                           rasterized=dark)
+
+            title = f"{row_label} — {panel}" if row_label else panel
             _style_axes(ax, theme, cx, cy, title, z_aspect=z_aspect)
+            # Spines off on black (the panel edge competes with the data), light
+            # grey on white where the panel needs a boundary.
+            for spine in ax.spines.values():
+                spine.set_visible(not dark)
+                spine.set_edgecolor("#cccccc")
 
     handles = [
-        matplotlib.patches.Patch(color=colour, label=gene) for gene, colour in hexes.items()
+        mpatches.Patch(facecolor=hexes[g],
+                       edgecolor="none" if dark else "#555555",
+                       linewidth=0.5, label=g)
+        for g in gene_list
     ]
     if handles:
-        axes[0][-1].legend(
-            handles=handles, fontsize=7, loc="upper right",
-            facecolor=theme.scene, labelcolor=theme.font, framealpha=0.85,
-        )
+        axes[0][-1].legend(handles=handles, fontsize=8, loc="upper right",
+                           facecolor=theme.paper, labelcolor=theme.font,
+                           edgecolor="#cccccc", framealpha=0.9)
     if suptitle:
-        fig.suptitle(suptitle, color=theme.font, fontsize=12)
+        fig.suptitle(suptitle, color=theme.font, fontsize=13)
     fig.tight_layout()
     _save_fig(fig, theme, save_path)
     return fig

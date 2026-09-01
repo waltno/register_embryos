@@ -245,18 +245,33 @@ def prepare_widget(
         )
 
     def oriented_frame() -> np.ndarray:
+        """The frame exactly as apply_orientation would produce it.
+
+        Order matters: rotation interpolates, so rotating a max projection is not
+        the same image as max-projecting rotated planes -- differences of ~0.15 on
+        a [0,1] image, i.e. clearly visible. The preview has to rotate per plane
+        and project afterwards, the way the volume is actually transformed, or the
+        contrast window is being judged against an image that never gets segmented.
+        """
         volume = current_volume()
         data = _transform_array(volume.binned_channels[channel_dd.value], transform)
         if flip_z_cb.value:
             data = data[::-1]
-        frame = data.max(axis=0) if proj_cb.value else data[z_slider.value]
         if flip_y_cb.value:
-            frame = frame[::-1, :]
+            data = data[:, ::-1]
         if flip_x_cb.value:
-            frame = frame[:, ::-1]
-        if angle_slider.value % 360:
-            frame = rotate_frame(frame, angle_slider.value, resize=resize_cb.value)
-        return frame
+            data = data[:, :, ::-1]
+
+        angle = angle_slider.value
+        if not angle % 360:
+            return data.max(axis=0) if proj_cb.value else data[z_slider.value]
+
+        if not proj_cb.value:
+            return rotate_frame(data[z_slider.value], angle, resize=resize_cb.value)
+        return np.stack([
+            rotate_frame(data[z], angle, resize=resize_cb.value)
+            for z in range(data.shape[0])
+        ]).max(axis=0)
 
     def redraw(*_) -> None:
         if state["guard"]:
