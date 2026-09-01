@@ -243,6 +243,29 @@ because positions are near-symmetric and expression domains are not — that cut
 cohort spread for wt1a from 69 → 43 px and tbx1 from 118 → 65 px. The applied
 in-plane rotation is printed per embryo, and anything beyond 90° is flagged.
 
+**Check orientation before you spend an hour segmenting.** Because registration now
+refines a manual orientation rather than re-deriving it, an embryo set wrong in the
+widget stays wrong, and no residual will tell you. `orientation_grid(volumes,
+orientations)` puts every embryo's oriented max projection side by side with its
+principal axis drawn on — an inconsistent anterior–posterior direction is obvious in
+one glance. `orientation_consistency(table)` is the numeric companion, and it reports
+each cloud's *elongation* alongside its axis: below ~1.3 the cloud is too circular for
+the angle to mean anything, which is the normal case here, so treat it as a supplement
+to looking at the images rather than a replacement.
+
+**Optional OT refinement.** `refine_with_ot=True` follows ICP with soft
+optimal-transport correspondences (entropic Sinkhorn, implemented in-package — no POT
+dependency). ICP pairs each source point with one nearest target point, which is
+brittle when embryos differ in nucleus count and density (2.5k–4.3k here) and lets many
+source points pile onto one target. An OT plan is mass-balanced instead, and the rigid
+fit is solved against each point's barycentric image. On the real cohort it moved
+gene-domain agreement slightly: wt1a 43→39, tbx1 65→64, pax2a 59→53 px, hand2 34→40,
+while mean NN rose 7.39→7.52. Marginal, so it is off by default. It stays **rigid** and
+is capped at ±5° — a non-rigid warp would align almost anything to anything, which is
+exactly what a consensus atlas must not do. **It does not resolve the orientation
+ambiguity**: a near-circular cloud is just as symmetric under OT as under nearest
+neighbours.
+
 **Why residuals are reported with one metric.** Mean nearest-neighbour distance
 compared against RMS nearest-neighbour distance makes a good fit look like a
 regression, because RMS of a positive quantity always exceeds its mean.

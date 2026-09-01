@@ -30,6 +30,8 @@ from scipy.spatial import cKDTree
 __all__ = [
     "HAS_OPEN3D",
     "rotation_angles",
+    "sinkhorn_plan",
+    "ot_refine",
     "RegistrationResult",
     "isotropic_downsample",
     "pca_align",
@@ -383,6 +385,143 @@ def icp_point_to_point(
 
 
 # ---------------------------------------------------------------------------
+# Optimal-transport refinement
+# ---------------------------------------------------------------------------
+
+def sinkhorn_plan(
+    cost: np.ndarray,
+    epsilon: float,
+    n_iter: int = 200,
+    weights_source: Optional[np.ndarray] = None,
+    weights_target: Optional[np.ndarray] = None,
+    tol: float = 1e-9,
+) -> np.ndarray:
+    """Entropic optimal-transport plan for a cost matrix, in the log domain.
+
+    Log-domain because the direct form computes ``exp(-cost/epsilon)``, which
+    underflows to zero for the small ``epsilon`` that makes the plan informative --
+    and then every row normalises to nan. Implemented here rather than pulled from
+    POT to keep the dependency list short; it is a few lines of Sinkhorn iteration.
+
+    Returns a plan whose rows sum to ``weights_source`` and columns to
+    ``weights_target``.
+    """
+    from scipy.special import logsumexp
+
+    n, m = cost.shape
+    a = np.full(n, 1.0 / n) if weights_source is None else weights_source / weights_source.sum()
+    b = np.full(m, 1.0 / m) if weights_target is None else weights_target / weights_target.sum()
+
+    log_a, log_b = np.log(a + 1e-300), np.log(b + 1e-300)
+    scaled = -cost / epsilon
+    f = np.zeros(n)
+    g = np.zeros(m)
+
+    for _ in range(n_iter):
+        f_prev = f
+        f = epsilon * (log_a - logsumexp(scaled + g[None, :] / epsilon, axis=1))
+        g = epsilon * (log_b - logsumexp(scaled + f[:, None] / epsilon, axis=0))
+        if np.max(np.abs(f - f_prev)) < tol:
+            break
+
+    return np.exp(scaled + f[:, None] / epsilon + g[None, :] / epsilon)
+
+
+def ot_refine(
+    source: np.ndarray,
+    target: np.ndarray,
+    epsilon: Optional[float] = None,
+    n_iter: int = 200,
+    max_points: int = 2000,
+    max_rotation_deg: Optional[float] = None,
+    inplane_only: bool = False,
+    seed: int = 42,
+    verbose: bool = True,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Refine an already-rigidly-aligned pair using soft OT correspondences.
+
+    ICP pairs each source point with its single nearest target point. That is brittle
+    in two ways this data actually exhibits: the embryos have different nucleus counts
+    and densities (2.5k-4.3k here), so many source points can pile onto one target
+    point and dominate the fit; and a hard assignment makes the objective piecewise
+    constant, which is what lets ICP sit in a local minimum. An entropic OT plan
+    replaces that with a soft, mass-balanced correspondence -- every target point
+    receives its share -- and the rigid fit is then solved against each source point's
+    barycentric image under the plan.
+
+    **This refines the fit; it does not resolve the orientation ambiguity.** A
+    near-circular cloud is just as symmetric under OT as under nearest neighbours, so
+    OT will not tell anterior from posterior either. Constrain the rotation for that
+    (see :func:`icp_point_to_point`); the constraint is honoured here too.
+
+    The transform stays **rigid**. A non-rigid OT warp would align almost anything to
+    almost anything, manufacturing agreement between embryos that differ for real
+    reasons -- which is exactly what a consensus atlas must not do.
+
+    Args:
+        epsilon: entropic regularisation, in squared distance units. ``None`` sets it
+            from the data (a small multiple of the median squared nearest-neighbour
+            distance), which is what keeps it scale-free across cohorts.
+        max_points: both clouds are uniformly subsampled to this before building the
+            cost matrix, which is dense and O(n*m).
+    """
+    rng = np.random.default_rng(seed)
+
+    def subsample(points: np.ndarray) -> np.ndarray:
+        if len(points) <= max_points:
+            return points
+        return points[rng.choice(len(points), max_points, replace=False)]
+
+    src_s, tgt_s = subsample(source), subsample(target)
+
+    cost = ((src_s[:, None, :] - tgt_s[None, :, :]) ** 2).sum(axis=-1)
+
+    if epsilon is None:
+        # Scale-free: a few times the typical nearest-neighbour separation, squared.
+        nn = cKDTree(tgt_s).query(tgt_s, k=2)[0][:, 1]
+        epsilon = float(2.0 * np.median(nn) ** 2)
+        epsilon = max(epsilon, 1e-6)
+
+    plan = sinkhorn_plan(cost, epsilon=epsilon, n_iter=n_iter)
+    mass = plan.sum(axis=1)
+    keep = mass > 1e-12
+    if keep.sum() < 3:
+        if verbose:
+            print("    [OT] plan degenerate; leaving the transform unchanged")
+        return source.copy(), np.eye(4)
+
+    # Barycentric projection: where the plan sends each source point.
+    projected = (plan[keep] @ tgt_s) / mass[keep, None]
+    weights = mass[keep]
+
+    src_c = np.average(src_s[keep], axis=0, weights=weights)
+    tgt_c = np.average(projected, axis=0, weights=weights)
+    centred_src = src_s[keep] - src_c
+    centred_tgt = projected - tgt_c
+    covariance = (centred_src * weights[:, None]).T @ centred_tgt
+    u, _, vt = np.linalg.svd(covariance)
+    rotation = vt.T @ u.T
+    if np.linalg.det(rotation) < 0:          # reflection guard
+        vt[-1, :] *= -1
+        rotation = vt.T @ u.T
+
+    transform = np.eye(4)
+    transform[:3, :3] = rotation
+    transform[:3, 3] = tgt_c - rotation @ src_c
+    transform = _constrain_rotation(
+        transform, source.mean(axis=0), max_rotation_deg, inplane_only
+    )
+
+    if verbose:
+        before = float(cKDTree(target).query(source)[0].mean())
+        after = float(cKDTree(target).query(_apply_transform(source, transform))[0].mean())
+        in_plane, tilt = rotation_angles(transform)
+        print(f"    [OT] epsilon={epsilon:.2f}  mean NN {before:.3f} -> {after:.3f}  "
+              f"(extra in-plane {in_plane:+.2f} deg, tilt {tilt:.2f} deg)")
+    return _apply_transform(source, transform), transform
+
+
+# ---------------------------------------------------------------------------
 # Cohort-level driver
 # ---------------------------------------------------------------------------
 
@@ -449,6 +588,9 @@ def register_frames(
     n_downsample: Optional[int] = 5000,
     center_first: bool = False,
     output_root: Optional[str | Path] = None,
+    refine_with_ot: bool = False,
+    ot_max_rotation_deg: float = 5.0,
+    ot_kwargs: Optional[Dict[str, object]] = None,
     verbose: bool = True,
     **icp_kwargs,
 ) -> RegistrationResult:
@@ -465,6 +607,10 @@ def register_frames(
             ``None`` to register the full clouds (slower, rarely better -- ICP on
             uniformly sampled clouds is both faster and less biased toward dense
             regions).
+        refine_with_ot: after ICP, refine with soft optimal-transport
+            correspondences (:func:`ot_refine`).  Still rigid, and capped tightly by
+            ``ot_max_rotation_deg`` -- it is a refinement, not a second chance to
+            re-orient.
         center_first: translate each cloud onto the reference centroid before
             ICP.  Useful for atlas-to-atlas alignment where the two clouds may
             sit in unrelated coordinate ranges.
@@ -472,6 +618,7 @@ def register_frames(
     if not frames:
         return RegistrationResult(pd.DataFrame(), pd.DataFrame(), "", {})
 
+    ot_kwargs = dict(ot_kwargs or {})
     tables = {
         embryo_id: (
             isotropic_downsample(df, n_target=n_downsample)
@@ -520,6 +667,17 @@ def register_frames(
             shift = np.eye(4)
             shift[:3, 3] = offset
             transform = transform @ shift
+
+            if refine_with_ot:
+                if verbose:
+                    print(f"    {embryo_id}: OT refinement")
+                transformed, extra = ot_refine(
+                    transformed, reference_cloud,
+                    max_rotation_deg=ot_max_rotation_deg,
+                    inplane_only=icp_kwargs.get("inplane_only", False),
+                    verbose=verbose, **ot_kwargs,
+                )
+                transform = extra @ transform
 
         out = df.copy()
         out[["x_reg", "y_reg", "z_reg"]] = transformed

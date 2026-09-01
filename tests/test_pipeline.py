@@ -1085,3 +1085,138 @@ def test_trust_orientation_can_be_turned_off():
     result = register_frames(frames, reference_embryo_id="ref", n_downsample=None,
                             verbose=False)   # unconstrained, the old behaviour
     assert abs(rotation_angles(result.transform_of("mov"))[0]) > 30.0
+
+
+# ---------------------------------------------------------------------------
+# Optimal-transport refinement
+# ---------------------------------------------------------------------------
+
+def test_sinkhorn_plan_is_mass_balanced():
+    from register_embryos.registration import sinkhorn_plan
+
+    cost = np.array([[0.0, 1.0, 4.0], [1.0, 0.0, 1.0], [4.0, 1.0, 0.0]])
+    plan = sinkhorn_plan(cost, epsilon=0.5)
+    assert plan.sum() == pytest.approx(1.0)
+    assert plan.sum(axis=1) == pytest.approx(np.full(3, 1 / 3))
+    assert plan.sum(axis=0) == pytest.approx(np.full(3, 1 / 3))
+    # Mass concentrates on the cheap pairs.
+    assert np.argmax(plan, axis=1).tolist() == [0, 1, 2]
+
+
+def test_sinkhorn_survives_a_small_epsilon():
+    """The direct form underflows here; the log-domain one must not."""
+    from register_embryos.registration import sinkhorn_plan
+
+    rng = np.random.default_rng(0)
+    cost = ((rng.normal(0, 50, (60, 3))[:, None, :]
+             - rng.normal(0, 50, (60, 3))[None, :, :]) ** 2).sum(-1)
+    plan = sinkhorn_plan(cost, epsilon=1e-2, n_iter=50)
+    assert np.isfinite(plan).all()
+    assert plan.sum() == pytest.approx(1.0, abs=1e-6)
+
+
+def test_sinkhorn_honours_supplied_marginals():
+    from register_embryos.registration import sinkhorn_plan
+
+    cost = np.abs(np.subtract.outer(np.arange(4.0), np.arange(3.0)))
+    a = np.array([0.4, 0.3, 0.2, 0.1])
+    b = np.array([0.5, 0.3, 0.2])
+    plan = sinkhorn_plan(cost, epsilon=0.3, weights_source=a, weights_target=b)
+    assert plan.sum(axis=1) == pytest.approx(a, abs=1e-6)
+    assert plan.sum(axis=0) == pytest.approx(b, abs=1e-6)
+
+
+def test_ot_refine_returns_a_rigid_transform():
+    """Rigid by construction: a non-rigid warp would manufacture agreement."""
+    from register_embryos.registration import ot_refine
+
+    target = _disc_cloud(seed=6)
+    source = _apply(target, _z_rotation(3.0)) + np.array([12.0, -8.0, 0.5])
+    _, transform = ot_refine(source, target, max_points=400, verbose=False)
+    R = transform[:3, :3]
+    assert np.allclose(R @ R.T, np.eye(3), atol=1e-6)     # orthogonal
+    assert np.linalg.det(R) == pytest.approx(1.0, abs=1e-6)   # proper, not a reflection
+
+
+def test_ot_refine_improves_a_small_residual_misalignment():
+    from scipy.spatial import cKDTree
+
+    from register_embryos.registration import ot_refine
+
+    target = _disc_cloud(seed=7)
+    source = _apply(target, _z_rotation(2.0)) + np.array([9.0, 6.0, 0.4])
+    refined, _ = ot_refine(source, target, max_points=600, verbose=False)
+    tree = cKDTree(target)
+    assert tree.query(refined)[0].mean() < tree.query(source)[0].mean()
+
+
+def test_ot_refine_respects_the_rotation_cap():
+    """It is a refinement, not a second chance to re-orient."""
+    from register_embryos.registration import ot_refine, rotation_angles
+
+    target = _disc_cloud(seed=8)
+    source = _apply(target, _z_rotation(60.0))
+    _, transform = ot_refine(source, target, max_points=400,
+                             max_rotation_deg=5.0, inplane_only=True, verbose=False)
+    in_plane, tilt = rotation_angles(transform)
+    assert abs(in_plane) <= 5.0 + 1e-6
+    assert tilt == pytest.approx(0.0, abs=1e-6)
+
+
+def test_register_frames_can_run_the_ot_stage():
+    from register_embryos.registration import register_frames
+
+    target = _disc_cloud(seed=9)
+    source = _apply(target, _z_rotation(4.0)) + np.array([15.0, 10.0, 0.5])
+    frames = {
+        "ref": pd.DataFrame(target, columns=["x", "y", "z"]).assign(embryo_id="ref"),
+        "mov": pd.DataFrame(source, columns=["x", "y", "z"]).assign(embryo_id="mov"),
+    }
+    plain = register_frames(frames, reference_embryo_id="ref", n_downsample=None,
+                            pca_init=False, verbose=False)
+    with_ot = register_frames(frames, reference_embryo_id="ref", n_downsample=None,
+                              pca_init=False, refine_with_ot=True,
+                              ot_kwargs={"max_points": 400}, verbose=False)
+    assert not np.allclose(with_ot.transform_of("mov"), plain.transform_of("mov"))
+    assert with_ot.stats["mean_after"].iloc[0] < with_ot.stats["mean_before"].iloc[0]
+
+
+# ---------------------------------------------------------------------------
+# Orientation consistency QC
+# ---------------------------------------------------------------------------
+
+def test_orientation_consistency_flags_an_off_axis_embryo():
+    from register_embryos.orientation import orientation_consistency
+
+    rng = np.random.default_rng(3)
+    frames = []
+    for name, degrees in (("a", 0.0), ("b", 3.0), ("c", 45.0)):
+        # Elongated so the principal axis is actually determined.
+        cloud = rng.normal(0, 1, (800, 3)) * np.array([200.0, 60.0, 4.0])
+        cloud = _apply(cloud, _z_rotation(degrees))
+        df = pd.DataFrame(cloud, columns=["x", "y", "z"])
+        df["embryo_id"] = name
+        frames.append(df)
+    table = pd.concat(frames, ignore_index=True)
+
+    out = orientation_consistency(table, verbose=False)
+    deviations = dict(zip(out["embryo_id"], out["deviation_deg"].abs()))
+    assert deviations["c"] > deviations["a"]
+    assert deviations["c"] > 20            # the off-axis one stands out
+    assert (out["elongation"] > 2.0).all()  # axis is meaningful for these
+
+
+def test_orientation_consistency_reports_low_elongation_as_unreliable(capsys):
+    """A near-circular cloud cannot settle orientation; say so rather than imply it can."""
+    from register_embryos.orientation import orientation_consistency
+
+    rng = np.random.default_rng(4)
+    frames = []
+    for name in ("a", "b"):
+        cloud = rng.normal(0, 1, (600, 3)) * np.array([180.0, 155.0, 4.0])
+        df = pd.DataFrame(cloud, columns=["x", "y", "z"])
+        df["embryo_id"] = name
+        frames.append(df)
+    out = orientation_consistency(pd.concat(frames, ignore_index=True), verbose=True)
+    assert (out["elongation"] < 1.3).all()
+    assert "cannot settle orientation" in capsys.readouterr().out

@@ -93,6 +93,8 @@ from .naming import (
 )
 from .orientation import (
     Orientation,
+    orientation_consistency,
+    orientation_grid,
     OrientationSet,
     apply_orientation,
     apply_orientation_to_points,
@@ -113,6 +115,9 @@ from .plotting import (
 )
 from .registration import (
     HAS_OPEN3D,
+    ot_refine,
+    sinkhorn_plan,
+    rotation_angles,
     RegistrationResult,
     icp_point_to_point,
     icp_residuals,
@@ -151,6 +156,7 @@ __all__ = [
     "load_embryo", "load_cohort", "bin_volume_by_z", "normalize_channel",
     # orientation
     "Orientation", "OrientationSet", "apply_orientation",
+    "orientation_grid", "orientation_consistency",
     "apply_orientation_to_volumes", "apply_orientation_to_points",
     # contrast
     "ContrastLimits", "auto_contrast_limits", "apply_contrast",
@@ -166,6 +172,7 @@ __all__ = [
     "build_nucleus_table", "build_cohort_tables",
     # registration
     "HAS_OPEN3D", "RegistrationResult", "isotropic_downsample", "pca_align",
+    "rotation_angles", "sinkhorn_plan", "ot_refine",
     "icp_point_to_point", "icp_residuals", "register_cohort", "register_frames",
     # atlas
     "Atlas", "build_atlas", "atlas_diagnostics", "align_atlases",
