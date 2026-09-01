@@ -107,6 +107,7 @@ from .plotting import (
     Theme,
     additive_style,
     plot_additive_2d,
+    plot_additive_gene_2d,
     plot_additive_3d,
     plot_gene_by_embryo,
     plot_gene_panels_2d,
@@ -128,11 +129,17 @@ from .registration import (
     register_frames,
 )
 from .thresholds import (
+    DEFAULT_THRESHOLD,
     ThresholdResult,
     apply_thresholds,
+    as_frames,
     call_thresholds,
+    gene_columns,
     otsu_threshold,
     plot_threshold_diagnostics,
+    positive_calls,
+    positive_fraction,
+    resolve_gene_cuts,
     threshold_sweep,
 )
 from .segmentation import (
@@ -181,9 +188,12 @@ __all__ = [
     # thresholds
     "ThresholdResult", "call_thresholds", "apply_thresholds",
     "otsu_threshold", "threshold_sweep", "plot_threshold_diagnostics",
+    "DEFAULT_THRESHOLD", "gene_columns", "as_frames", "resolve_gene_cuts",
+    "positive_calls", "positive_fraction",
     # plotting
     "Theme", "DARK", "LIGHT", "theme_for", "GENE_RGB", "additive_style",
     "plot_pointcloud_3d", "plot_additive_3d", "plot_additive_2d",
+    "plot_additive_gene_2d",
     "plot_gene_panels_2d", "plot_gene_by_embryo", "plot_registration_2d",
     # workflow
     "CohortWorkflow", "CohortOutputs", "run_cohort", "run_all_cohorts", "scan",

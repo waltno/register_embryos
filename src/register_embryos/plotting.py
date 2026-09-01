@@ -29,6 +29,9 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
+# Safe at module level: thresholds imports plotting only lazily, inside functions.
+from .thresholds import DEFAULT_THRESHOLD
+
 __all__ = [
     "GENE_RGB",
     "XY_AXES",
@@ -41,6 +44,7 @@ __all__ = [
     "plot_pointcloud_3d",
     "plot_additive_3d",
     "plot_additive_2d",
+    "plot_additive_gene_2d",
     "plot_registration_2d",
     "plot_gene_panels_2d",
     "plot_gene_by_embryo",
@@ -70,7 +74,9 @@ FALLBACK_RGB = [
     np.array([0.70, 0.50, 1.00]),
 ]
 
-INTENSITY_THRESH = 0.05
+#: The pipeline's constant positivity cut, aliased from :mod:`register_embryos.thresholds`
+#: rather than restated, so the two cannot drift apart.
+INTENSITY_THRESH = DEFAULT_THRESHOLD
 
 
 @dataclass(frozen=True)
@@ -184,6 +190,7 @@ def additive_style(
     threshold=INTENSITY_THRESH,
     size_range: Tuple[float, float] = (1.0, 14.0),
     alpha_low: float = 0.15,
+    gate_below_threshold: bool = False,
 ) -> Dict[str, object]:
     """Per-nucleus colour, size and opacity from the additive channel mix.
 
@@ -207,6 +214,16 @@ def additive_style(
             notebooks used 0.1, which pushes nearly everything to full size.
         quantile_clip: intensity at this quantile of the channel sum maps to
             maximum size, so a few saturated nuclei do not flatten the rest.
+        gate_below_threshold: zero each sub-threshold channel *before* mixing, so
+            only the genes a nucleus is actually positive for contribute to its hue
+            and its size.  Off by default, which is what the original notebook did:
+            the threshold then decides only *whether* to colour a nucleus, and every
+            channel tints it regardless.  That is tolerable with three genes and
+            actively misleading with eight -- and worst in an atlas, where kNN
+            averaging leaves every point with a small non-zero value in every
+            channel, so every hue is a blend and the figure comes out a wash of
+            mixed colours no flat threshold can clean up.  Turn it on and a point
+            positive for pax2a alone reads as pax2a green.
     """
     theme = theme_for(mode)
     gene_list = _resolve_genes(df, genes)
@@ -225,17 +242,6 @@ def additive_style(
         }
 
     values = df[gene_list].fillna(0).to_numpy(dtype=float)
-    mixed = np.zeros((n, 3))
-    for column, gene in enumerate(gene_list):
-        mixed += np.outer(values[:, column], gene_color(gene, column))
-
-    summed = values.sum(axis=1)
-    ceiling = float(np.quantile(summed, quantile_clip))
-    intensity = np.clip(summed / (ceiling + 1e-9), 0, 1) ** gamma
-
-    clipped = np.clip(mixed, 0, 1)
-    peak = clipped.max(axis=1, keepdims=True)
-    bright = clipped / np.where(peak > 1e-9, peak, 1.0)
 
     # threshold may be one number for every gene, or a per-gene mapping -- the
     # data-driven cuts from register_embryos.thresholds differ per gene, and a
@@ -244,7 +250,22 @@ def additive_style(
         cuts = np.array([float(threshold.get(g, INTENSITY_THRESH)) for g in gene_list])
     else:
         cuts = np.full(len(gene_list), float(threshold))
-    hi_mask = (values >= cuts[None, :]).any(axis=1)
+    above = values >= cuts[None, :]
+    contributing = np.where(above, values, 0.0) if gate_below_threshold else values
+
+    mixed = np.zeros((n, 3))
+    for column, gene in enumerate(gene_list):
+        mixed += np.outer(contributing[:, column], gene_color(gene, column))
+
+    summed = contributing.sum(axis=1)
+    ceiling = float(np.quantile(summed, quantile_clip))
+    intensity = np.clip(summed / (ceiling + 1e-9), 0, 1) ** gamma
+
+    clipped = np.clip(mixed, 0, 1)
+    peak = clipped.max(axis=1, keepdims=True)
+    bright = clipped / np.where(peak > 1e-9, peak, 1.0)
+
+    hi_mask = above.any(axis=1)
     rgb = np.where(hi_mask[:, None], bright, theme.silent_rgb[None, :])
     size_min, size_max = size_range
 
@@ -544,6 +565,7 @@ def plot_additive_2d(
     save_path: Optional[str | Path] = None,
     panel_size: float = 5.0,
     z_aspect: Optional[float] = None,
+    n_cols: Optional[int] = None,
     **style_kwargs,
 ):
     """Additive-overlay projections, one row per entry in ``frames``.
@@ -565,6 +587,10 @@ def plot_additive_2d(
             Silent nuclei keep a solid-ish outline so they read as tissue context;
             expressing nuclei get a soft one so the fill colour dominates.
         z_aspect: xy pixels per z step, so XZ/YZ are drawn in true proportion.
+        n_cols: reflow the frames into a grid this many panels wide. Only allowed
+            with a single projection, where frames-as-rows would otherwise make a
+            one-panel-wide column -- a seven-embryo cohort in one XY view is a
+            35-inch strip as rows and a readable 4x2 grid here.
 
     Colours, sizes and opacities are written as explicit per-point RGBA arrays rather
     than passed as scalar ``alpha=``: a scalar would apply one opacity to the whole
@@ -596,17 +622,38 @@ def plot_additive_2d(
     hexes = gene_hex(gene_list)
     stroke_rgb = matplotlib.colors.to_rgb(stroke_color)
 
+    # Panels in frame-major order, so one loop serves both layouts.
+    panels = [(row_label, df, coord_set)
+              for row_label, df in frame_list for coord_set in coord_sets]
+    if n_cols is not None and len(coord_sets) > 1:
+        raise ValueError(
+            f"n_cols reflows frames into a grid and needs exactly one projection; "
+            f"got {len(coord_sets)}"
+        )
+    if n_cols is None:
+        grid_cols = len(coord_sets)
+    else:
+        grid_cols = max(1, min(int(n_cols), len(panels)))
+    grid_rows = int(np.ceil(len(panels) / grid_cols))
+
     fig, axes = plt.subplots(
-        len(frame_list), len(coord_sets),
-        figsize=(panel_size * len(coord_sets), panel_size * len(frame_list)),
+        grid_rows, grid_cols,
+        figsize=(panel_size * grid_cols, panel_size * grid_rows),
         facecolor=theme.paper, squeeze=False,
     )
+    flat_axes = [ax for row in axes for ax in row]
+    for ax in flat_axes[len(panels):]:
+        ax.set_visible(False)
 
-    for row, (row_label, df) in enumerate(frame_list):
+    styled: Dict[str, Dict[str, object]] = {}
+    for row_label, df in frame_list:
         if style_of is not None:
-            st = style_of[row_label] if isinstance(style_of, dict) else style_of
+            styled[row_label] = style_of[row_label] if isinstance(style_of, dict) else style_of
         else:
-            st = additive_style(df, genes, mode=mode, **style_kwargs)
+            styled[row_label] = additive_style(df, genes, mode=mode, **style_kwargs)
+
+    for index, (row_label, df, (cx, cy, panel)) in enumerate(panels):
+        st = styled[row_label]
         rgb = np.asarray(st["rgb"])
         sizes = np.asarray(st["sizes"]) * size_scale
         hi = np.asarray(st["hi_mask"])
@@ -616,31 +663,33 @@ def plot_additive_2d(
         layers = [(~hi, silent_alpha, silent_stroke_alpha),
                   (hi, 1.0, colored_stroke_alpha)]
 
-        for col, (cx, cy, panel) in enumerate(coord_sets):
-            ax = axes[row][col]
-            ax.set_facecolor(theme.paper)
-            # Positional throughout: the style arrays are positional, and a frame
-            # sliced out of a concatenated table keeps its original labels.
-            xv, yv = df[cx].to_numpy(), df[cy].to_numpy()
+        ax = flat_axes[index]
+        ax.set_facecolor(theme.paper)
+        # Positional throughout: the style arrays are positional, and a frame
+        # sliced out of a concatenated table keeps its original labels.
+        xv, yv = df[cx].to_numpy(), df[cy].to_numpy()
 
-            for mask, fill_alpha, stroke_alpha in layers:
-                k = int(mask.sum())
-                if not k:
-                    continue
-                face = np.column_stack([rgb[mask], np.full(k, fill_alpha)])
-                edge = np.column_stack([np.tile(stroke_rgb, (k, 1)),
-                                        np.full(k, stroke_alpha)])
-                ax.scatter(xv[mask], yv[mask], c=face, s=sizes[mask],
-                           edgecolors=edge, linewidths=stroke_width,
-                           rasterized=dark)
+        for mask, fill_alpha, stroke_alpha in layers:
+            k = int(mask.sum())
+            if not k:
+                continue
+            face = np.column_stack([rgb[mask], np.full(k, fill_alpha)])
+            edge = np.column_stack([np.tile(stroke_rgb, (k, 1)),
+                                    np.full(k, stroke_alpha)])
+            ax.scatter(xv[mask], yv[mask], c=face, s=sizes[mask],
+                       edgecolors=edge, linewidths=stroke_width,
+                       rasterized=dark)
 
-            title = f"{row_label} — {panel}" if row_label else panel
-            _style_axes(ax, theme, cx, cy, title, z_aspect=z_aspect)
-            # Spines off on black (the panel edge competes with the data), light
-            # grey on white where the panel needs a boundary.
-            for spine in ax.spines.values():
-                spine.set_visible(not dark)
-                spine.set_edgecolor("#cccccc")
+        if row_label and len(coord_sets) > 1:
+            title = f"{row_label} — {panel}"
+        else:
+            title = row_label or panel
+        _style_axes(ax, theme, cx, cy, title, z_aspect=z_aspect)
+        # Spines off on black (the panel edge competes with the data), light
+        # grey on white where the panel needs a boundary.
+        for spine in ax.spines.values():
+            spine.set_visible(not dark)
+            spine.set_edgecolor("#cccccc")
 
     handles = [
         mpatches.Patch(facecolor=hexes[g],
@@ -649,7 +698,7 @@ def plot_additive_2d(
         for g in gene_list
     ]
     if handles:
-        axes[0][-1].legend(handles=handles, fontsize=8, loc="upper right",
+        flat_axes[grid_cols - 1].legend(handles=handles, fontsize=8, loc="upper right",
                            facecolor=theme.paper, labelcolor=theme.font,
                            edgecolor="#cccccc", framealpha=0.9)
     if suptitle:
@@ -657,6 +706,153 @@ def plot_additive_2d(
     fig.tight_layout()
     _save_fig(fig, theme, save_path)
     return fig
+
+
+def plot_additive_gene_2d(
+    source,
+    threshold=INTENSITY_THRESH,
+    genes: Optional[Sequence[str]] = None,
+    mode: str = "dark",
+    coords: Optional[Sequence[str]] = None,
+    require: str = "any",
+    keep_silent: bool = False,
+    projections: Sequence[str] = ("XY",),
+    n_cols: Optional[int] = None,
+    label: Optional[str] = None,
+    suptitle: str = "",
+    gamma: float = 0.35,
+    quantile_clip: float = 0.95,
+    size_range: Tuple[float, float] = (1.0, 14.0),
+    gate_below_threshold: bool = True,
+    save_path: Optional[str | Path] = None,
+    verbose: bool = True,
+    **plot_kwargs,
+):
+    """Additive gene overlay for **either** registered embryos or an atlas, thresholded.
+
+    The same call works on both spaces:
+
+    >>> plot_additive_gene_2d(registered, threshold=0.05)          # rows = embryos
+    >>> plot_additive_gene_2d(atlas, threshold="q0.9")             # one composite
+
+    and that is the point -- a threshold is only interpretable next to the same
+    threshold applied the same way to the other space, and the two spaces do **not**
+    want the same number. Single-embryo intensity is a per-nucleus mean over assigned
+    signal pixels; an atlas point is a k-nearest-neighbour average of those means, so
+    kNN averaging pulls every point toward its local mean. That raises the floor
+    (nuclei near a domain inherit some of it) and lowers the peaks, which is exactly
+    the direction that makes a cut tuned on embryos call far too much of an atlas
+    positive. Adding genes to the panel pushes the same way, because positivity is a
+    union over channels and the signal mask is too.
+
+    Unlike :func:`plot_additive_2d`, sub-threshold nuclei are **dropped** rather than
+    drawn grey (``keep_silent=True`` restores them as context). Dropping is what makes
+    a too-low threshold visible: greyed-out nuclei still occupy the panel, so an
+    over-inclusive cut looks like a dense embryo either way.
+
+    Args:
+        source: an :class:`~register_embryos.atlas.Atlas`, a registered nucleus table
+            (split into one row per ``embryo_id``), a single frame, a
+            ``{label: frame}`` mapping, or ``[(label, frame), ...]``.
+        threshold: any spec :func:`~register_embryos.thresholds.resolve_gene_cuts`
+            takes -- a number, a ``{gene: cut}`` mapping, the ``results`` dict from
+            :func:`~register_embryos.thresholds.call_thresholds`, ``"otsu"``, or a
+            positive-rate quantile like ``"q0.9"``. String specs are recomputed per
+            frame, so each embryo (or the atlas) gets its own cut.
+        require: ``"any"`` keeps nuclei positive for at least one gene -- "drop the
+            nuclei that lack signal in every channel". ``"all"`` keeps only nuclei
+            positive for every gene measured in that frame.
+        projections: which panels to draw, from ``"XY"``/``"XZ"``/``"YZ"``. XY only by
+            default: a 12s dorsal mount is a few z-bins thick, so XZ and YZ are mostly
+            a statement about section thickness.
+        n_cols: with one projection, reflow the frames into a grid this wide instead
+            of a single tall column. Defaults to 4 for a multi-embryo cohort.
+        gate_below_threshold: on by default here (and off in
+            :func:`plot_additive_2d`, which keeps the original notebook behaviour):
+            a nucleus is tinted only by the genes it is positive for. Without it the
+            threshold decides only whether to colour a nucleus while all eight
+            channels still tint it, which is what turns an eight-gene atlas into a
+            wash of blended hues at every cut.
+        gamma / quantile_clip / size_range: passed to :func:`additive_style`, which is
+            computed on the **full** frame before dropping, so dot sizes stay
+            comparable between a thresholded figure and its ``keep_silent=True`` twin.
+
+    Prints the positive fraction per frame and per gene;
+    :func:`~register_embryos.thresholds.positive_fraction` returns the same table
+    without drawing anything, which is the cheaper way to pick a cut.
+    """
+    from .thresholds import as_frames, positive_calls, resolve_gene_cuts
+
+    frames = as_frames(source, label=label)
+    if not frames:
+        raise ValueError("nothing to plot: no frames in source")
+
+    wanted = {str(p).upper() for p in projections}
+    coord_cols = _resolve_coords(frames[0][1], coords)
+    coord_sets = [c for c in _projection_cols(coord_cols) if c[2] in wanted]
+    if not coord_sets:
+        raise ValueError(
+            f"no panels left: projections={tuple(projections)} matched none of "
+            f"'XY', 'XZ', 'YZ'"
+        )
+    gene_list = _resolve_genes(frames[0][1], genes)
+
+    kept_frames: List[Tuple[str, pd.DataFrame]] = []
+    styles: Dict[str, Dict[str, object]] = {}
+    rows = []
+    for frame_label, frame in frames:
+        cuts = resolve_gene_cuts(frame, gene_list, threshold, embryo_id=frame_label)
+        keep, per_gene, measured = positive_calls(frame, gene_list, cuts, require=require)
+        if keep_silent:
+            keep = np.ones(len(frame), dtype=bool)
+
+        style = additive_style(
+            frame, gene_list, mode=mode, threshold=cuts, gamma=gamma,
+            quantile_clip=quantile_clip, size_range=size_range,
+            gate_below_threshold=gate_below_threshold,
+        )
+        styles[frame_label] = {
+            key: (np.asarray(value)[keep] if key in ("rgb", "hex", "sizes", "alpha",
+                                                     "summed", "hi_mask")
+                  else value)
+            for key, value in style.items()
+        }
+        kept_frames.append((frame_label, frame.iloc[keep]))
+
+        n = len(frame)
+        for column, gene in enumerate(measured):
+            n_pos = int(per_gene[:, column].sum())
+            rows.append({"label": frame_label, "gene": gene, "threshold": cuts[gene],
+                         "n": n, "n_positive": n_pos,
+                         "positive_fraction": n_pos / n if n else np.nan})
+        rows.append({"label": frame_label, "gene": "<kept>", "threshold": np.nan,
+                     "n": n, "n_positive": int(keep.sum()),
+                     "positive_fraction": keep.sum() / n if n else np.nan})
+
+    if verbose:
+        spec = threshold if isinstance(threshold, (str, float, int)) else "per-gene"
+        print(f"  [ADDITIVE] threshold={spec}, require={require}, "
+              f"{'keeping' if keep_silent else 'dropping'} sub-threshold nuclei")
+        for row in rows:
+            cut = "" if not np.isfinite(row["threshold"]) else f"thr={row['threshold']:.4f}  "
+            print(f"    {str(row['label'])[:44]:44s} {row['gene']:8s} {cut}"
+                  f"{row['n_positive']:7,d}/{row['n']:,} = {row['positive_fraction']:6.1%}")
+        empty = [label for label, frame in kept_frames if frame.empty]
+        if empty:
+            print(f"    [WARN] threshold left nothing to draw for: {', '.join(empty)}")
+
+    if n_cols is not None and len(coord_sets) > 1:
+        raise ValueError(
+            f"n_cols reflows frames into a grid and needs exactly one projection; "
+            f"got {len(coord_sets)} ({', '.join(c[2] for c in coord_sets)})"
+        )
+    if n_cols is None and len(coord_sets) == 1 and len(kept_frames) > 1:
+        n_cols = min(4, len(kept_frames))
+    return plot_additive_2d(
+        kept_frames, coord_sets=coord_sets, style_of=styles, mode=mode,
+        genes=gene_list, suptitle=suptitle, save_path=save_path,
+        n_cols=n_cols, **plot_kwargs,
+    )
 
 
 def plot_gene_panels_2d(

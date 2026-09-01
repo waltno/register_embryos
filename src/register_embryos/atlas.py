@@ -74,6 +74,7 @@ def build_atlas(
     coord_cols: Sequence[str] = REG_COLS,
     weight_by_distance: bool = False,
     exclude_self_embryo: bool = False,
+    mask_unmeasured: bool = True,
     seed: int = 42,
     verbose: bool = True,
 ) -> Atlas:
@@ -95,6 +96,23 @@ def build_atlas(
             embryo.  Makes the atlas a genuine leave-one-out consensus -- use it
             when you intend to ask how well the reference embryo agrees with the
             atlas, since otherwise the reference is partly predicting itself.
+        mask_unmeasured: average each gene only over the neighbours that actually
+            measured it, and leave the point NaN where none did.  This matters a
+            lot with a rotating gene panel: with ``False`` (the old behaviour) a
+            neighbour from an embryo that never imaged a gene contributes a hard
+            **zero** to that gene's mean, so a gene carried by one embryo out of
+            seven comes out roughly seven times too dim -- confounding "not
+            measured" with "measured as absent".  Measured on this project's
+            cohort, the p90 intensity fell 2.3x for a gene in 4/7 embryos but
+            6.5x for a gene in 1/7, which no single atlas threshold can undo
+            because the factor differs per gene *and* per point.  With ``True``
+            an atlas intensity is on the same scale as the per-embryo intensities
+            it came from, so a positivity cut transfers between the two spaces --
+            what is left is genuine kNN smoothing.
+
+    Per-gene neighbour support lands in ``Atlas.diagnostics`` as
+    ``support_<gene>`` columns (how many neighbours contributed), not in
+    ``Atlas.points``, so gene auto-detection cannot mistake it for a channel.
     """
     if registered.empty:
         raise ValueError("registered table is empty")
@@ -131,7 +149,14 @@ def build_atlas(
     anchors = anchors_df[coords_present].to_numpy(dtype=float)
 
     pool = registered[coords_present].to_numpy(dtype=float)
-    pool_values = registered[gene_list].fillna(0).to_numpy(dtype=float) if gene_list else None
+    if gene_list:
+        raw_values = registered[gene_list].to_numpy(dtype=float)
+        # measured[i, g]: embryo i's panel includes gene g at all.  A NaN in the
+        # registered table means "not in this embryo's panel", never "zero".
+        measured = np.isfinite(raw_values)
+        pool_values = np.where(measured, raw_values, 0.0)
+    else:
+        raw_values = pool_values = measured = None
     pool_embryos = registered["embryo_id"].to_numpy()
 
     k = int(min(k_neighbors, len(pool)))
@@ -163,10 +188,24 @@ def build_atlas(
     averaged_coords = (pool[safe_indices] * weights[:, :, None]).sum(axis=1) / weight_sums
     atlas = pd.DataFrame(averaged_coords, columns=["x", "y", "z"])
 
+    support = None
     if gene_list:
-        averaged_values = (
-            pool_values[safe_indices] * weights[:, :, None]
-        ).sum(axis=1) / weight_sums
+        contributions = (pool_values[safe_indices] * weights[:, :, None]).sum(axis=1)
+        if mask_unmeasured:
+            # One weight sum per gene, over the neighbours that measured it.
+            gene_weights = weights[:, :, None] * measured[safe_indices]
+            gene_weight_sums = gene_weights.sum(axis=1)
+            support = (gene_weights > 0).sum(axis=1)
+            averaged_values = np.divide(
+                contributions, gene_weight_sums,
+                out=np.full_like(contributions, np.nan),
+                where=gene_weight_sums > 0,
+            )
+        else:
+            averaged_values = contributions / weight_sums
+            support = np.tile(
+                valid.sum(axis=1)[:, None], (1, len(gene_list))
+            )
         for column_index, gene in enumerate(gene_list):
             atlas[gene] = averaged_values[:, column_index]
 
@@ -178,6 +217,9 @@ def build_atlas(
     )
     atlas["n_source_embryos"] = diagnostics["n_embryos"].to_numpy()
     atlas["neighbor_radius"] = diagnostics["max_distance"].to_numpy()
+    if support is not None:
+        for column_index, gene in enumerate(gene_list):
+            diagnostics[f"support_{gene}"] = support[:, column_index]
 
     result = Atlas(
         points=atlas,
@@ -198,6 +240,23 @@ def build_atlas(
             f"{diagnostics['max_distance'].median():.2f}, p95 "
             f"{diagnostics['max_distance'].quantile(0.95):.2f}"
         )
+        if mask_unmeasured and support is not None:
+            print("          per-gene neighbour support (median, and % of points "
+                  "with none):")
+            for column_index, gene in enumerate(gene_list):
+                counts = support[:, column_index]
+                print(f"            {gene:10s} median {np.median(counts):4.1f}/"
+                      f"{k}   {100.0 * (counts == 0).mean():5.1f}% unmeasured")
+            thin = [
+                gene for column_index, gene in enumerate(gene_list)
+                if np.median(support[:, column_index]) < 3
+            ]
+            if thin:
+                print(
+                    f"          [WARN] median support < 3 for {', '.join(thin)} -- "
+                    f"those channels are a nearest-neighbour lookup, not a "
+                    f"consensus; raise k"
+                )
         single = int((diagnostics["n_embryos"] <= 1).sum())
         if single:
             print(

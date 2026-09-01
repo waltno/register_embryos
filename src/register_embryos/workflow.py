@@ -436,13 +436,23 @@ class CohortWorkflow:
     ) -> Atlas:
         """Consensus atlas from the registered cohort.
 
-        ``k_neighbors`` defaults to the embryo count, which averages roughly one
-        nucleus per embryo per atlas point -- enough to suppress per-embryo noise
-        without blurring domain boundaries.
+        ``k_neighbors`` defaults to **twice** the embryo count. One nucleus per
+        embryo per point sounds like the natural choice and is too few whenever the
+        gene panel rotates: a gene carried by 2 of 7 embryos then has one or zero
+        measuring neighbours at most points, so its atlas channel is a
+        nearest-neighbour lookup rather than a consensus, and it looks like noise
+        scattered over the whole embryo. On this project's 7-embryo cohort, spatially
+        coherent domains only appeared from about k=15. Watch the per-gene support
+        that :func:`~register_embryos.atlas.build_atlas` prints and raise ``k`` until
+        the rarest gene has a few neighbours -- the cost is spatial smoothing, which
+        the neighbour radius reports.
         """
         if self.registration is None:
             raise RuntimeError("call register() first")
-        k = k_neighbors if k_neighbors is not None else max(2, len(self.registration.embryo_ids))
+        k = (
+            k_neighbors if k_neighbors is not None
+            else max(4, 2 * len(self.registration.embryo_ids))
+        )
         print(f"\n{'='*72}\nATLAS — {self.cohort.name}\n{'='*72}")
         self.atlas = build_atlas(
             self.registration.registered,
@@ -459,17 +469,37 @@ class CohortWorkflow:
 
     # -- figures and provenance --------------------------------------------
 
-    def plot_all(self, modes: Sequence[str] = ("dark", "light")) -> List[Path]:
+    def plot_all(
+        self,
+        modes: Sequence[str] = ("dark", "light"),
+        threshold=0.05,
+        atlas_threshold=None,
+    ) -> List[Path]:
         """Write the standard figure set in each theme.
 
         Both themes by default: the dark ones are for looking at, the light ones
         for putting in a figure, and generating them together means they never
         drift apart.
+
+        Args:
+            threshold: positivity cut for the ``*_thresholded_*`` figures, which
+                drop sub-threshold nuclei and tint each nucleus only by the genes
+                it is positive for. Any spec
+                :func:`~register_embryos.thresholds.resolve_gene_cuts` takes.
+            atlas_threshold: the same for the atlas, which needs its own number
+                once a cohort carries many genes -- positivity is a union over
+                channels, so more genes means more nuclei clear *something*, and
+                kNN averaging narrows the spread the cut has to land in. Defaults
+                to ``threshold``; use
+                :func:`~register_embryos.thresholds.positive_fraction` to pick one.
         """
         from .plotting import (
-            plot_additive_2d, plot_additive_3d, plot_gene_panels_2d,
-            plot_pointcloud_3d, plot_registration_2d,
+            plot_additive_2d, plot_additive_3d, plot_additive_gene_2d,
+            plot_gene_panels_2d, plot_pointcloud_3d, plot_registration_2d,
         )
+
+        if atlas_threshold is None:
+            atlas_threshold = threshold
 
         figure_dir = self.output_dir / "figures"
         figure_dir.mkdir(parents=True, exist_ok=True)
@@ -496,6 +526,15 @@ class CohortWorkflow:
                 )
                 written.append(path)
 
+                path = figure_dir / f"embryos_additive_thresholded_{mode}.png"
+                plot_additive_gene_2d(
+                    registered, threshold=threshold, mode=mode, panel_size=4.2,
+                    verbose=(mode == modes[0]),
+                    suptitle=f"{self.cohort.name} — positive nuclei only",
+                    save_path=path,
+                )
+                written.append(path)
+
             if self.atlas is not None:
                 points = self.atlas.points
                 for name, plotter, kwargs in (
@@ -510,6 +549,15 @@ class CohortWorkflow:
                     )
                     written.append(path)
 
+                path = figure_dir / f"atlas_additive_thresholded_{mode}.png"
+                plot_additive_gene_2d(
+                    self.atlas, threshold=atlas_threshold, mode=mode, panel_size=5.0,
+                    verbose=(mode == modes[0]),
+                    suptitle=f"{self.cohort.name} atlas — positive points only",
+                    save_path=path,
+                )
+                written.append(path)
+
                 for name, plotter in (
                     ("atlas_additive_3d", plot_additive_3d),
                     ("atlas_per_gene_3d", plot_pointcloud_3d),
@@ -521,6 +569,12 @@ class CohortWorkflow:
                     )
                     written.append(path)
 
+        self._params.update({
+            "figure_threshold": threshold if isinstance(threshold, (str, int, float))
+                                else "per-gene",
+            "figure_atlas_threshold": atlas_threshold
+                if isinstance(atlas_threshold, (str, int, float)) else "per-gene",
+        })
         self.figures = written
         print(f"  {len(written)} figure(s) -> {figure_dir}")
         return written

@@ -334,6 +334,54 @@ on black reads washed out on white. A nucleus counts as expressing when *one*
 channel clears threshold, not when the channel sum does — otherwise a nucleus
 could be coloured while being positive for nothing.
 
+**Calling nuclei positive, and why the atlas needs its own number.**
+`plot_additive_gene_2d` is the thresholded additive view, and it takes registered
+embryos or an atlas through the same call:
+
+```python
+from register_embryos import plot_additive_gene_2d, positive_fraction
+
+plot_additive_gene_2d(registered, threshold=0.05)      # rows/grid of embryos
+plot_additive_gene_2d(atlas, threshold="q0.95")        # one composite
+positive_fraction(atlas, threshold=0.15)               # pick a cut without plotting
+```
+
+Sub-threshold nuclei are **dropped** rather than greyed (`keep_silent=True` brings
+them back as context), and a nucleus is tinted only by the genes it is positive for
+(`gate_below_threshold`, on here and off in `plot_additive_2d`, which keeps the
+original notebook behaviour). Gating matters more as panels grow: with eight
+channels every atlas point carries a small non-zero value in all of them, so an
+ungated hue is always a blend and no threshold cleans it up. `threshold` accepts a
+number, a `{gene: cut}` mapping, the `results` dict from `call_thresholds`, `"otsu"`,
+or a positive-rate quantile like `"q0.95"`; the string forms are recomputed per
+frame, which is the point for an atlas.
+
+The two spaces genuinely want different numbers. Positivity is a **union** over
+channels, so adding genes to a cohort raises the fraction of nuclei that clear
+*something* even with every channel unchanged — on this project's 7-embryo, 8-gene
+cohort a flat 0.05 keeps 60–88% of nuclei per embryo and 92% of atlas points. Use
+`positive_fraction` to choose, and prefer a per-gene cut: the same 0.05 means a
+different brightness in every embryo, because contrast is set per embryo by eye.
+
+**Why the atlas averages each gene only over the neighbours that measured it.**
+With a rotating gene panel a nucleus table is full of NaN — "not in this embryo's
+panel", not "measured as absent". Averaging those in as zeros makes a gene carried
+by one embryo out of seven come out roughly seven times too dim, and the factor
+differs per gene *and* per point, so no atlas threshold can undo it. `build_atlas`
+therefore takes a masked weighted mean (`mask_unmeasured=True`) and leaves a point
+NaN where no neighbour measured the gene. Measured on the real cohort, this restored
+each channel to its per-embryo scale (osr1 p90 0.058 → 0.419 against a per-embryo
+0.380), which is what lets a cut transfer between the two spaces at all.
+
+**Why `k` defaults to twice the embryo count.** One neighbour per embryo per point
+is too few whenever the panel rotates: a gene in 2 of 7 embryos then has one or zero
+measuring neighbours at most points, so its atlas channel is a nearest-neighbour
+lookup and reads as noise sprayed across the embryo. On the real cohort, coherent
+domains appeared from about k=15 (median per-gene support 2–10) where k=3 gave
+median support 0–2 and no structure. `build_atlas` prints per-gene support and warns
+when a channel's median falls below 3; raise `k` until the rarest gene has a few,
+and watch the neighbour radius for the spatial smoothing that buys.
+
 ## Running 3D segmentation on a GPU
 
 3D CPSAM over a 1024×1024 stack is minutes per z-bin on CPU, so a whole cohort

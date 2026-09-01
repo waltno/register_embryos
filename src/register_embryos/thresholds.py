@@ -39,12 +39,19 @@ import pandas as pd
 
 __all__ = [
     "ThresholdResult",
+    "DEFAULT_THRESHOLD",
+    "NON_GENE_COLUMNS",
+    "gene_columns",
     "otsu_threshold",
     "gmm_threshold",
     "call_thresholds",
     "apply_thresholds",
     "threshold_sweep",
     "plot_threshold_diagnostics",
+    "as_frames",
+    "resolve_gene_cuts",
+    "positive_calls",
+    "positive_fraction",
 ]
 
 #: Below this valley depth a split is not trustworthy.
@@ -58,6 +65,35 @@ __all__ = [
 #: "this gene is cleanly on or off".  Report :func:`threshold_sweep` alongside any
 #: threshold-dependent conclusion.
 MIN_SEPARATION = 0.15
+
+#: The pipeline's constant cut, kept as the fallback everywhere a data-driven cut
+#: cannot be reached.  Same number as :data:`register_embryos.plotting.INTENSITY_THRESH`,
+#: which imports it from here so the two can never drift.
+DEFAULT_THRESHOLD = 0.05
+
+#: Columns in a nucleus or atlas table that are bookkeeping, not gene channels.
+NON_GENE_COLUMNS = frozenset({
+    "embryo_id", "nucleus_id", "atlas_point_id", "n_voxels", "n_source_embryos",
+    "neighbor_radius", "x", "y", "z", "x_reg", "y_reg", "z_reg",
+    "x_um", "y_um", "z_um",
+})
+
+
+def gene_columns(
+    table: pd.DataFrame, genes: Optional[Sequence[str]] = None
+) -> List[str]:
+    """The gene channels in a table: numeric columns that are not bookkeeping.
+
+    Given an explicit ``genes``, keeps only those actually present -- panels differ
+    across a cohort, so asking for a gene an embryo does not have is normal.
+    """
+    if genes is not None:
+        return [gene for gene in genes if gene in table.columns]
+    return [
+        column for column in table.columns
+        if column not in NON_GENE_COLUMNS
+        and pd.api.types.is_numeric_dtype(table[column])
+    ]
 
 
 @dataclass
@@ -229,13 +265,7 @@ def call_thresholds(
     off in that embryo -- a legitimate answer, but not one a data-driven cut can give
     you on its own.
     """
-    skip = {"embryo_id", "nucleus_id", "atlas_point_id", "n_voxels", "n_source_embryos",
-            "neighbor_radius", "x", "y", "z", "x_reg", "y_reg", "z_reg",
-            "x_um", "y_um", "z_um"}
-    gene_list = list(genes) if genes is not None else [
-        c for c in table.columns
-        if c not in skip and pd.api.types.is_numeric_dtype(table[c])
-    ]
+    gene_list = gene_columns(table, genes)
 
     groups = (
         table.groupby("embryo_id") if per_embryo and "embryo_id" in table.columns
@@ -340,13 +370,7 @@ def threshold_sweep(
     The honest way to report a threshold-dependent number: show that the conclusion
     survives the choice, or say that it does not.
     """
-    skip = {"embryo_id", "nucleus_id", "atlas_point_id", "n_voxels", "n_source_embryos",
-            "neighbor_radius", "x", "y", "z", "x_reg", "y_reg", "z_reg",
-            "x_um", "y_um", "z_um"}
-    gene_list = list(genes) if genes is not None else [
-        c for c in table.columns
-        if c not in skip and pd.api.types.is_numeric_dtype(table[c])
-    ]
+    gene_list = gene_columns(table, genes)
     groups = (
         table.groupby("embryo_id") if per_embryo and "embryo_id" in table.columns
         else [("<cohort>", table)]
@@ -437,3 +461,213 @@ def plot_threshold_diagnostics(
         fig.savefig(path, dpi=150, facecolor=theme.paper, bbox_inches="tight")
         print(f"  [SAVED] {path}")
     return fig
+
+# ---------------------------------------------------------------------------
+# Applying a threshold: one place that turns a *spec* into concrete cuts
+# ---------------------------------------------------------------------------
+
+def as_frames(source, label: Optional[str] = None) -> List[Tuple[str, pd.DataFrame]]:
+    """Normalise any of this package's nucleus tables to ``[(label, frame), ...]``.
+
+    One helper so the same call works on a registered cohort, one embryo, or an
+    atlas -- the two spaces are the same table shape and deserve the same tools,
+    and the only real difference is that a registered table is long-form over
+    ``embryo_id`` while an atlas is a single composite.
+
+    Accepts an :class:`~register_embryos.atlas.Atlas` (duck-typed on ``.points``), a
+    dataframe (split by ``embryo_id`` when it holds more than one), a
+    ``{label: frame}`` mapping, or an explicit ``[(label, frame), ...]`` list.
+    """
+    points = getattr(source, "points", None)
+    if isinstance(points, pd.DataFrame):
+        return [(label or str(getattr(source, "label", "atlas")), points)]
+    if isinstance(source, pd.DataFrame):
+        if "embryo_id" in source.columns and source["embryo_id"].nunique() > 1:
+            return [
+                (str(embryo_id), source[source["embryo_id"] == embryo_id])
+                for embryo_id in source["embryo_id"].unique()
+            ]
+        if label is None and "embryo_id" in source.columns and len(source):
+            label = str(source["embryo_id"].iloc[0])
+        return [(label or "", source)]
+    if isinstance(source, dict):
+        return [(str(k), v) for k, v in source.items()]
+    return [(str(k), v) for k, v in source]
+
+
+def resolve_gene_cuts(
+    frame: pd.DataFrame,
+    genes: Sequence[str],
+    threshold=DEFAULT_THRESHOLD,
+    embryo_id: Optional[str] = None,
+    default: float = DEFAULT_THRESHOLD,
+) -> Dict[str, float]:
+    """Turn a threshold *spec* into one concrete cut per gene.
+
+    Accepted specs, in order of how much say the data gets:
+
+    ``0.05``
+        one number for every gene.
+    ``{"hand2": 0.2, ...}``
+        a cut per gene; genes not named fall back to ``default``.
+    ``results``
+        the ``{(embryo, gene): ThresholdResult}`` dict from
+        :func:`call_thresholds`; the entry for ``embryo_id`` wins, then a plain
+        ``gene`` key, then ``default``.
+    ``"otsu"``
+        split each gene's own distribution **in this frame**, falling back to
+        ``default`` where there is no usable valley (see :data:`MIN_SEPARATION`).
+    ``"q0.9"``
+        call the brightest 10% of nuclei positive -- a fixed positive *rate*
+        rather than a fixed intensity.
+
+    The string forms are computed from the frame being thresholded, which is the
+    point for an atlas: kNN averaging pulls every point toward its local mean, so
+    a cut calibrated on single-embryo intensities is simply the wrong cut there.
+    Quantiles are taken over **all** nuclei including the zeros, so ``"q0.9"``
+    means what it says about the population you are plotting.
+    """
+    gene_list = list(genes)
+    if isinstance(threshold, str):
+        spec = threshold.strip().lower()
+        if spec == "otsu":
+            cuts = {}
+            for gene in gene_list:
+                values = (
+                    _clean(frame[gene].to_numpy()) if gene in frame.columns
+                    else np.array([])
+                )
+                if values.size == 0:
+                    cuts[gene] = float(default)
+                    continue
+                cut, separation = otsu_threshold(values)
+                cuts[gene] = (
+                    float(cut)
+                    if np.isfinite(cut) and separation >= MIN_SEPARATION
+                    else float(default)
+                )
+            return cuts
+        if spec.startswith("q"):
+            try:
+                q = float(spec[1:])
+            except ValueError as error:
+                raise ValueError(f"could not read a quantile from {threshold!r}") from error
+            if not 0.0 < q < 1.0:
+                raise ValueError(f"quantile must be in (0, 1), got {q}")
+            cuts = {}
+            for gene in gene_list:
+                values = (
+                    _clean(frame[gene].to_numpy()) if gene in frame.columns
+                    else np.array([])
+                )
+                cuts[gene] = (
+                    float(np.quantile(values, q)) if values.size else float(default)
+                )
+            return cuts
+        raise ValueError(
+            f"unknown threshold spec {threshold!r} -- expected a number, a "
+            f"{{gene: cut}} mapping, 'otsu', or a quantile like 'q0.9'"
+        )
+
+    if isinstance(threshold, dict):
+        cuts = {}
+        for gene in gene_list:
+            entry = threshold.get((embryo_id, gene)) if embryo_id is not None else None
+            if entry is None:
+                entry = threshold.get(gene)
+            cuts[gene] = (
+                float(default) if entry is None
+                else float(getattr(entry, "threshold", entry))
+            )
+        return cuts
+
+    return {gene: float(threshold) for gene in gene_list}
+
+
+def positive_calls(
+    frame: pd.DataFrame,
+    genes: Sequence[str],
+    cuts: Dict[str, float],
+    require: str = "any",
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    """Per-gene and per-nucleus positivity. Returns ``(keep, per_gene, measured)``.
+
+    ``keep`` is the per-nucleus mask, ``per_gene`` an ``(n, len(measured))`` boolean
+    matrix, ``measured`` the genes that are actually recorded in this frame -- a gene
+    absent from an embryo's panel is all-NaN and is excluded rather than counted as
+    negative everywhere.
+
+    Args:
+        require: ``"any"`` keeps a nucleus positive for at least one gene -- the
+            reading of "drop nuclei that lack signal in any channel", and the only
+            one that makes sense for a rotating-panel design. ``"all"`` keeps
+            nuclei positive for every gene *measured in that frame*, i.e. the
+            co-expressing core; per-nucleus NaN counts as negative there.
+    """
+    measured = [
+        gene for gene in genes
+        if gene in frame.columns and frame[gene].notna().any()
+    ]
+    if not measured:
+        n = len(frame)
+        return np.zeros(n, dtype=bool), np.zeros((n, 0), dtype=bool), []
+
+    values = frame[measured].to_numpy(dtype=float)
+    thresholds = np.array([float(cuts.get(gene, DEFAULT_THRESHOLD)) for gene in measured])
+    per_gene = np.nan_to_num(values, nan=-np.inf) >= thresholds[None, :]
+
+    if require == "any":
+        keep = per_gene.any(axis=1)
+    elif require == "all":
+        keep = per_gene.all(axis=1)
+    else:
+        raise ValueError(f"require must be 'any' or 'all', got {require!r}")
+    return keep, per_gene, measured
+
+
+def positive_fraction(
+    source,
+    genes: Optional[Sequence[str]] = None,
+    threshold=DEFAULT_THRESHOLD,
+    require: str = "any",
+    label: Optional[str] = None,
+    verbose: bool = False,
+) -> pd.DataFrame:
+    """How many nuclei a threshold calls positive, per frame and per gene.
+
+    The table to read *before* choosing a cut -- especially for an atlas, where the
+    right number is not the one that works on single embryos. Rows with
+    ``gene == "<kept>"`` give the union (or intersection, under ``require="all"``):
+    the nuclei a plot would actually draw.
+
+    Accepts everything :func:`as_frames` accepts, and any spec
+    :func:`resolve_gene_cuts` accepts.
+    """
+    frames = as_frames(source, label=label)
+    rows = []
+    for frame_label, frame in frames:
+        gene_list = gene_columns(frame, genes)
+        cuts = resolve_gene_cuts(frame, gene_list, threshold, embryo_id=frame_label)
+        keep, per_gene, measured = positive_calls(frame, gene_list, cuts, require=require)
+        n = len(frame)
+        for column, gene in enumerate(measured):
+            n_pos = int(per_gene[:, column].sum())
+            rows.append({
+                "label": frame_label, "gene": gene, "threshold": cuts[gene],
+                "n": n, "n_positive": n_pos,
+                "positive_fraction": n_pos / n if n else np.nan,
+            })
+        n_keep = int(keep.sum())
+        rows.append({
+            "label": frame_label, "gene": "<kept>", "threshold": np.nan,
+            "n": n, "n_positive": n_keep,
+            "positive_fraction": n_keep / n if n else np.nan,
+        })
+    table = pd.DataFrame(rows)
+    if verbose and not table.empty:
+        print(f"  [POSITIVE] require={require}")
+        for _, row in table.iterrows():
+            cut = "" if not np.isfinite(row["threshold"]) else f"thr={row['threshold']:.4f}  "
+            print(f"    {str(row['label'])[:44]:44s} {row['gene']:8s} {cut}"
+                  f"{row['n_positive']:7,d}/{row['n']:,} = {row['positive_fraction']:6.1%}")
+    return table
