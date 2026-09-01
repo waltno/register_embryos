@@ -365,3 +365,41 @@ def test_an_empty_run_lists_what_was_tried(tmp_path):
     (tmp_path / "20260901").mkdir()
     with pytest.raises(FileNotFoundError, match="Tried:"):
         find_masks_dir(tmp_path / "20260901", cohort_name="wt_12s_dorsal_20X")
+
+
+# -- keeping debris out of the nucleus table ----------------------------------
+
+def test_2d_assignment_cap_drops_debris_far_from_any_nucleus():
+    """Unbounded nearest-nucleus assignment measures a distant speck as expression."""
+    from register_embryos.assignment import assign_signal_pixels_2d
+
+    masks = np.zeros((1, 64, 64), dtype=int)
+    masks[0, 2:6, 2:6] = 1                 # one nucleus in the corner
+    signal = np.zeros((1, 64, 64), dtype=bool)
+    signal[0, 7, 7] = True                 # genuine perinuclear signal, ~2 px away
+    signal[0, 60, 60] = True               # debris, most of the frame away
+
+    unbounded = assign_signal_pixels_2d(masks, signal, xy_um=1.0, verbose=False)
+    assert unbounded[0, 7, 7] == 1
+    assert unbounded[0, 60, 60] == 1       # handed to the only nucleus there is
+
+    capped = assign_signal_pixels_2d(masks, signal, xy_um=1.0, max_distance=10.0,
+                                     verbose=False)
+    assert capped[0, 7, 7] == 1            # near signal survives
+    assert capped[0, 60, 60] == 0          # debris does not
+
+
+def test_2d_assignment_cap_is_in_micrometres_not_pixels():
+    """A cap stated in um must not change meaning when the binning does."""
+    from register_embryos.assignment import assign_signal_pixels_2d
+
+    masks = np.zeros((1, 32, 32), dtype=int)
+    masks[0, 0, 0] = 1
+    signal = np.zeros((1, 32, 32), dtype=bool)
+    signal[0, 0, 10] = True                # 10 px from the nucleus
+
+    # 10 px at 0.5 um/px is 5 um -> inside a 6 um cap; at 2 um/px it is 20 um -> out.
+    assert assign_signal_pixels_2d(masks, signal, xy_um=0.5, max_distance=6.0,
+                                   verbose=False)[0, 0, 10] == 1
+    assert assign_signal_pixels_2d(masks, signal, xy_um=2.0, max_distance=6.0,
+                                   verbose=False)[0, 0, 10] == 0

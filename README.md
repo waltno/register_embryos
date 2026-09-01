@@ -204,6 +204,39 @@ inside the nuclear stain, so measuring only inside the Cellpose mask throws most
 of it away. Each above-threshold pixel is given to its nearest nucleus and the
 per-nucleus value is the mean over that expanded territory.
 
+**What defines measured territory, and how debris gets in.** A per-nucleus gene value
+is a mean over the pixels assigned to that nucleus, so which pixels count is the whole
+measurement. `mask_source` chooses:
+
+- `"genes"` (default) — a pixel counts where any gene channel clears
+  `signal_threshold`. Follows the HCR signal into the perinuclear space where most of
+  it sits.
+- `"nuclei"` — a pixel counts where the nuclear channel clears `nuclei_threshold`.
+  Excludes anything bright in a gene channel that carries no nuclear stain, and
+  decouples the gene windows from each other, but changes what is being measured.
+- `"all"` — union over every channel.
+
+Measured on this project's 20× dorsal data, `"nuclei"` at a DAPI cut of 0.05 kept only
+**3.6%** of pixels (and 0.01 kept 4.2% — the curve is flat, because the nuclear window
+was set for segmentation and normalised DAPI is near zero across most tissue). At that
+coverage it is a *nucleus* mask, not a tissue mask: territory collapses onto the
+Cellpose masks and the p90 gene intensity falls about 30× (hand2 0.518 → 0.017, wt1a
+0.143 → 0.005), because HCR signal is largely outside the nuclear stain. So it is
+available, and it is not the way to remove debris on this data.
+
+**The cap is what removes debris.** Nearest-nucleus assignment has no notion of "too
+far": one bright speck in the corner of the frame is measured into whichever nucleus
+happens to be closest, however many cell diameters away. `max_assign_distance_um`
+drops pixels beyond a distance from any nucleus, in micrometres, and now applies in
+**2D as well as 3D** — it was 3D-only, which is the mode nobody was running:
+
+```python
+wf.build_tables(signal_threshold=0.05, max_assign_distance_um=20.0)
+```
+
+It leaves the scale of every real measurement untouched, which is the difference
+between excluding debris and re-defining expression.
+
 **Why background is `0.3`, not `0`.** A pixel dropped as background was never
 measured. Averaging it in as zero would drag every nucleus mean toward zero in
 proportion to how much empty space its territory covers, so the sentinel is

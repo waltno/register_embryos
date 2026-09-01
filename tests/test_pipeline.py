@@ -205,16 +205,38 @@ def _toy_channels():
     return {0: nuclei, 1: gene}
 
 
-def test_signal_mask_excludes_the_nuclear_channel():
-    """Including nuclei would make the mask a nucleus mask, defeating the point."""
+def test_gene_sourced_mask_excludes_the_nuclear_channel():
+    """The default mask follows the genes, so nuclear stain alone is not signal."""
     channels = _toy_channels()
     mask = build_signal_mask(channels, signal_threshold=0.05, verbose=False)
     assert mask[0, 0, 2]        # gene signal outside the nucleus
     assert not mask[0, 1, 1]    # nuclear stain only -> not signal
-    with_nuclei = build_signal_mask(
-        channels, signal_threshold=0.05, gene_channels_only=False, verbose=False
-    )
-    assert with_nuclei[0, 1, 1]
+    assert build_signal_mask(
+        channels, signal_threshold=0.05, source="all", verbose=False
+    )[0, 1, 1]
+
+
+def test_nuclei_sourced_mask_drops_gene_only_debris():
+    """The reason to switch: a bright gene pixel with no nuclear stain is debris."""
+    channels = _toy_channels()
+    channels[1][0, 3, 3] = 0.95      # very bright, nowhere near any nucleus
+
+    genes = build_signal_mask(channels, signal_threshold=0.05, verbose=False)
+    nuclei = build_signal_mask(channels, source="nuclei", nuclei_threshold=0.05,
+                               verbose=False)
+    assert genes[0, 3, 3]            # gene-sourced: debris becomes territory
+    assert not nuclei[0, 3, 3]       # nuclei-sourced: excluded outright
+    assert nuclei[0, 1, 1]           # tissue with no gene signal is still measured
+
+
+def test_nuclei_sourced_mask_needs_the_nuclear_channel():
+    with pytest.raises(ValueError, match="needs channel 0"):
+        build_signal_mask({1: np.zeros((1, 2, 2))}, source="nuclei", verbose=False)
+
+
+def test_unknown_mask_source_is_rejected():
+    with pytest.raises(ValueError, match="unknown mask source"):
+        build_signal_mask(_toy_channels(), source="cytoplasm", verbose=False)
 
 
 def test_signal_pixels_are_assigned_to_the_nearest_nucleus():

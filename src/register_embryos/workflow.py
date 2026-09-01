@@ -396,17 +396,48 @@ class CohortWorkflow:
         return segmented
 
     def build_tables(
-        self, signal_threshold: float = 0.05, verbose: bool = True, **kwargs
+        self,
+        signal_threshold: float = 0.05,
+        mask_source: str = "genes",
+        nuclei_threshold: Optional[float] = None,
+        max_assign_distance_um: Optional[float] = None,
+        verbose: bool = True,
+        **kwargs,
     ) -> pd.DataFrame:
-        """Assign signal pixels to nuclei and build the combined nucleus table."""
+        """Assign signal pixels to nuclei and build the combined nucleus table.
+
+        Args:
+            mask_source: which channels define measured territory. ``"genes"`` (the
+                original) follows the gene channels; ``"nuclei"`` follows the nuclear
+                stain, which excludes debris that is bright in a gene channel but
+                carries no DAPI, and decouples the gene windows from each other. See
+                :func:`~register_embryos.assignment.build_signal_mask` -- switching
+                puts every gene value on a lower scale, so re-pick the positivity cut
+                with :func:`~register_embryos.thresholds.positive_fraction`.
+            nuclei_threshold: the DAPI cut under ``mask_source="nuclei"``. Defaults to
+                ``signal_threshold``.
+            max_assign_distance_um: drop signal pixels further than this from any
+                nucleus. The direct defence against bright debris -- without it,
+                nearest-nucleus assignment is unbounded and a speck in the corner of
+                the frame is measured into whichever nucleus is nearest.
+        """
         if not self.segmented:
             raise RuntimeError("call segment() first")
         print(f"\n{'='*72}\nNUCLEUS TABLES — {self.cohort.name}\n{'='*72}")
         self.results, self.combined = build_cohort_tables(
             self.segmented, signal_threshold=signal_threshold,
+            mask_source=mask_source, nuclei_threshold=nuclei_threshold,
+            max_assign_distance_um=max_assign_distance_um,
             output_root=self.output_dir, verbose=verbose, **kwargs,
         )
-        self._params["signal_threshold"] = signal_threshold
+        self._params.update({
+            "signal_threshold": signal_threshold,
+            "mask_source": mask_source,
+            "max_assign_distance_um": max_assign_distance_um,
+            "nuclei_threshold": (
+                signal_threshold if nuclei_threshold is None else nuclei_threshold
+            ),
+        })
         return self.combined
 
     def register(
@@ -734,6 +765,9 @@ def run_cohort(
     gpu: bool = False,
     max_workers: int = 1,
     signal_threshold: float = 0.05,
+    mask_source: str = "genes",
+    nuclei_threshold: Optional[float] = None,
+    max_assign_distance_um: Optional[float] = None,
     reference_embryo_id: Optional[str] = None,
     n_downsample: Optional[int] = 5000,
     k_neighbors: Optional[int] = None,
@@ -801,7 +835,11 @@ def run_cohort(
             mode=segmentation_mode, gpu=gpu, diameter=diameter,
             max_workers=max_workers, verbose=verbose,
         )
-    workflow.build_tables(signal_threshold=signal_threshold, verbose=verbose)
+    workflow.build_tables(
+        signal_threshold=signal_threshold, mask_source=mask_source,
+        nuclei_threshold=nuclei_threshold,
+        max_assign_distance_um=max_assign_distance_um, verbose=verbose,
+    )
     workflow.register(
         reference_embryo_id=reference_embryo_id, n_downsample=n_downsample, verbose=verbose
     )

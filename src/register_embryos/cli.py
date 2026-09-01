@@ -133,6 +133,20 @@ def run(
     contrast_json: Optional[Path] = typer.Option(
         None, "--contrast", help="contrast_limits.json from the widget."
     ),
+    mask_source: str = typer.Option(
+        "genes", "--mask-source",
+        help="Which channels define measured territory: 'genes' (union over gene "
+             "channels), 'nuclei' (DAPI, excludes gene-bright debris), or 'all'.",
+    ),
+    nuclei_threshold: Optional[float] = typer.Option(
+        None, "--nuclei-threshold",
+        help="DAPI cut for --mask-source nuclei. Defaults to --signal-threshold.",
+    ),
+    max_assign_distance: Optional[float] = typer.Option(
+        None, "--max-assign-distance",
+        help="Drop signal pixels further than this many um from any nucleus. "
+             "Excludes bright debris; unbounded by default.",
+    ),
     masks_from: Optional[Path] = typer.Option(
         None, "--masks-from",
         help="Reuse nuclear masks from a previous run instead of running Cellpose. "
@@ -177,6 +191,9 @@ def run(
         gpu=gpu,
         max_workers=workers,
         signal_threshold=signal_threshold,
+        mask_source=mask_source,
+        nuclei_threshold=nuclei_threshold,
+        max_assign_distance_um=max_assign_distance,
         n_downsample=downsample or None,
         k_neighbors=k_neighbors,
         n_atlas_points=atlas_points,

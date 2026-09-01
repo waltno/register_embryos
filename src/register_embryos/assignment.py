@@ -2,10 +2,16 @@
 
 HCR signal sits in cytoplasm and around nuclei, not inside the nuclear stain, so
 measuring gene intensity inside the Cellpose mask alone throws most of it away.
-The fix, kept from the original pipeline: threshold each gene channel to find
-signal-bearing pixels, drop everything below threshold as background, and give
-each surviving pixel the label of the nearest nucleus.  The per-nucleus intensity
-is then the mean over that expanded territory.
+The fix, kept from the original pipeline: pick out the pixels that count as
+measured territory, drop everything else as background, and give each surviving
+pixel the label of the nearest nucleus.  The per-nucleus intensity is then the mean
+over that expanded territory.
+
+What defines "measured territory" is a real choice -- ``mask_source="genes"``
+follows the gene channels themselves, ``"nuclei"`` follows the nuclear stain, i.e.
+tissue.  See :func:`build_signal_mask`; the short version is that the gene-channel
+mask measures bright debris as expression and couples the channels together, while
+the nuclear mask does neither but puts every value on a lower scale.
 
 One correctness note carried over deliberately: pixels dropped as background are
 set to ``BACKGROUND_VALUE`` (0.3) rather than 0, and the per-nucleus mean excludes
@@ -73,35 +79,82 @@ class EmbryoResult:
 def build_signal_mask(
     channels: Dict[int, np.ndarray],
     signal_threshold: float = 0.05,
-    gene_channels_only: bool = True,
+    source: str = "genes",
     nuclei_channel: int = 0,
+    nuclei_threshold: Optional[float] = None,
     verbose: bool = True,
 ) -> np.ndarray:
-    """Boolean mask of pixels where at least one channel clears the threshold.
+    """Boolean mask of the pixels that count as measured territory.
+
+    Which channels define that territory is the choice here, and it is not a
+    cosmetic one:
+
+    ``"genes"``
+        A pixel is kept where **any gene channel** clears ``signal_threshold``.
+        The original behaviour. It follows the HCR signal wherever it is, including
+        the perinuclear space the nuclear stain does not cover -- but it is defined
+        by the same channels being measured, so bright debris in a gene channel
+        creates its own territory and is measured as if it were expression, and
+        the channels are coupled to each other (see :func:`_apply_background`).
+    ``"nuclei"``
+        A pixel is kept where the **nuclear channel** clears ``nuclei_threshold``,
+        i.e. where there is tissue. Debris that is bright in a gene channel but
+        carries no nuclear stain is excluded outright, which is the point. It also
+        breaks the circularity: territory no longer depends on any gene's contrast
+        window, so gene windows can be tuned one at a time.
+
+        The trade is scale. A gene's per-nucleus value becomes a mean over all
+        tissue pixels in its territory rather than over the signal-bearing ones,
+        so every value falls and the positivity cut has to be re-picked from the
+        data (:func:`~register_embryos.thresholds.positive_fraction`). Signal that
+        genuinely sits outside the nuclear stain is also lost, so keep
+        ``nuclei_threshold`` low enough that the mask is a tissue mask and not a
+        nucleus mask -- check the reported percentage against the embryo's actual
+        footprint in the frame.
+    ``"all"``
+        Union over every channel including the nuclear one.
 
     Args:
-        gene_channels_only: exclude the nuclear channel from the union.  The
-            nuclear stain is bright nearly everywhere a nucleus is, so including
-            it makes the mask a nucleus mask and defeats the point of expanding
-            territory into where the HCR signal actually is.
+        nuclei_threshold: cut for the nuclear channel under ``source="nuclei"``.
+            Defaults to ``signal_threshold``; kept separate because the nuclear
+            stain and a gene channel have no reason to share a cut.
     """
-    considered = [
-        index
-        for index in sorted(channels)
-        if not (gene_channels_only and index == nuclei_channel)
-    ]
+    if source == "genes":
+        considered = [index for index in sorted(channels) if index != nuclei_channel]
+        cut = signal_threshold
+    elif source == "nuclei":
+        if nuclei_channel not in channels:
+            raise ValueError(
+                f"source='nuclei' needs channel {nuclei_channel}; have "
+                f"{sorted(channels)}"
+            )
+        considered = [nuclei_channel]
+        cut = signal_threshold if nuclei_threshold is None else nuclei_threshold
+    elif source == "all":
+        considered = sorted(channels)
+        cut = signal_threshold
+    else:
+        raise ValueError(
+            f"unknown mask source {source!r} (expected 'genes', 'nuclei' or 'all')"
+        )
     if not considered:
         raise ValueError("no channels left to build a signal mask from")
 
     mask = np.zeros(channels[considered[0]].shape, dtype=bool)
     for index in considered:
-        mask |= channels[index] > signal_threshold
+        mask |= channels[index] > cut
     if verbose:
         pct = 100.0 * mask.sum() / mask.size
         print(
-            f"  [SIGNAL] threshold={signal_threshold} over channels {considered}: "
-            f"{mask.sum():,}/{mask.size:,} px ({pct:.2f}%)"
+            f"  [SIGNAL] source={source!r} threshold={cut} over channels "
+            f"{considered}: {mask.sum():,}/{mask.size:,} px ({pct:.2f}%)"
         )
+        if source == "nuclei" and pct < 5.0:
+            print(
+                f"  [WARN] only {pct:.2f}% of pixels kept -- at this cut the nuclear "
+                f"mask is closer to a nucleus mask than a tissue mask, and "
+                f"perinuclear signal will be dropped. Lower nuclei_threshold."
+            )
     return mask
 
 
@@ -128,8 +181,14 @@ def _apply_background(
     pixels only, which pushes low-level graded expression toward either the threshold
     or zero -- it reads more binary.
 
-    The union mask still decides *territory* (which nucleus a pixel belongs to) in
-    both modes; this only governs what is treated as measured.
+    The mask still decides *territory* (which nucleus a pixel belongs to) in both
+    modes; this only governs what is treated as measured.
+
+    Both readings change meaning under ``mask_source="nuclei"``. The mask is then a
+    tissue mask that no gene's contrast can move, so ``"union"`` no longer couples the
+    channels -- it simply measures every gene over the tissue in its territory, and
+    ``signal_threshold`` is not consulted at all. ``"per_channel"`` then means
+    "tissue **and** this gene above its cut", which is the intersection.
     """
     filtered: Dict[int, np.ndarray] = {}
     for index, data in channels.items():
@@ -150,15 +209,29 @@ def _apply_background(
 def assign_signal_pixels_2d(
     nuclear_masks: np.ndarray,
     signal_mask: np.ndarray,
+    xy_um: float = 1.0,
+    max_distance: Optional[float] = None,
     verbose: bool = True,
 ) -> np.ndarray:
     """Nearest-nucleus assignment within each z-slice independently.
 
     Matches per-slice 2D labels: a pixel can only join a nucleus present on its
     own slice, so a slice with no nuclei contributes nothing.
+
+    Args:
+        max_distance: in micrometres. A signal pixel further than this from any
+            nucleus on its slice stays unassigned instead of being handed to the
+            nearest one. **This is what excludes debris**: nearest-nucleus
+            assignment has no notion of "too far", so one bright speck of debris
+            off in the corner of the frame is measured into whichever nucleus
+            happens to be closest, however many cell diameters away that is. The
+            cap is the only thing standing between that and the nucleus table.
+        xy_um: in-plane pixel size, so ``max_distance`` can be stated in
+            micrometres rather than in pixels of whatever binning is in force.
     """
     assigned = nuclear_masks.copy()
-    total = 0
+    max_px = None if max_distance is None else float(max_distance) / float(xy_um)
+    total, dropped = 0, 0
     for z in range(nuclear_masks.shape[0]):
         frame = nuclear_masks[z]
         if frame.max() <= 0:
@@ -169,12 +242,22 @@ def assign_signal_pixels_2d(
         nucleus_points = np.column_stack(np.nonzero(frame))
         tree = cKDTree(nucleus_points)
         query_points = np.column_stack(np.nonzero(unassigned))
-        _, indices = tree.query(query_points)
-        nearest = nucleus_points[indices]
-        assigned[z][unassigned] = frame[nearest[:, 0], nearest[:, 1]]
-        total += len(query_points)
+        distances, indices = tree.query(query_points)
+        keep = (
+            np.ones(len(query_points), dtype=bool) if max_px is None
+            else distances <= max_px
+        )
+        kept = query_points[keep]
+        nearest = nucleus_points[indices[keep]]
+        assigned[z][kept[:, 0], kept[:, 1]] = frame[nearest[:, 0], nearest[:, 1]]
+        total += int(keep.sum())
+        dropped += int((~keep).sum())
     if verbose:
-        print(f"  [ASSIGN 2D] {total:,} signal pixels assigned to nearest in-slice nucleus")
+        print(
+            f"  [ASSIGN 2D] {total:,} signal pixels assigned to nearest in-slice "
+            f"nucleus"
+            + (f", {dropped:,} beyond {max_distance} um dropped" if dropped else "")
+        )
     return assigned
 
 
@@ -334,6 +417,8 @@ def build_nucleus_table(
     gene_volume: Optional[Dict[int, np.ndarray]] = None,
     max_assign_distance_um: Optional[float] = None,
     signal_mask_mode: str = "union",
+    mask_source: str = "genes",
+    nuclei_threshold: Optional[float] = None,
     save: bool = True,
     verbose: bool = True,
 ) -> EmbryoResult:
@@ -346,6 +431,18 @@ def build_nucleus_table(
         signal_mask_mode: ``"union"`` or ``"per_channel"``; see
             :func:`_apply_background`. Use ``"per_channel"`` to make each gene's
             values depend only on its own contrast window.
+        max_assign_distance_um: drop signal pixels further than this from any
+            nucleus, in micrometres. Applies in **both** 2D and 3D now. This is
+            the direct defence against bright debris: without it, nearest-nucleus
+            assignment has no upper bound and a speck in the corner of the frame is
+            measured into whichever nucleus is nearest.
+        mask_source: which channels define measured territory -- ``"genes"``,
+            ``"nuclei"`` or ``"all"``; see :func:`build_signal_mask`.
+            ``"nuclei"`` restricts territory to the nuclear stain, which also
+            excludes gene-bright debris but changes the scale of every value; on
+            this project's data a DAPI cut of 0.05 kept only 3.6% of pixels, i.e.
+            it was a nucleus mask, so prefer the distance cap for debris.
+        nuclei_threshold: the nuclear-channel cut under ``mask_source="nuclei"``.
     """
     volume = segmented.volume
     channels = dict(segmented.adjusted_channels)
@@ -357,8 +454,20 @@ def build_nucleus_table(
         if verbose:
             print(f"  [CHANNELS] gene channels overridden: {sorted(gene_volume)}")
 
+    if verbose and mask_source == "nuclei" and signal_mask_mode == "union":
+        # Easy to lose an afternoon to: under these two settings nothing consults
+        # signal_threshold at all -- the nuclear cut decides territory and every
+        # channel is measured over it.
+        print(
+            f"  [NOTE] mask_source='nuclei' with signal_mask_mode='union': "
+            f"signal_threshold={signal_threshold} is not used. Territory is "
+            f"DAPI > {signal_threshold if nuclei_threshold is None else nuclei_threshold}"
+            f"; use signal_mask_mode='per_channel' to also require each gene to "
+            f"clear its own cut."
+        )
     signal_mask = build_signal_mask(
-        channels, signal_threshold=signal_threshold, verbose=verbose
+        channels, signal_threshold=signal_threshold, source=mask_source,
+        nuclei_threshold=nuclei_threshold, verbose=verbose,
     )
     channels_filtered = _apply_background(
         channels, signal_mask, mode=signal_mask_mode,
@@ -376,7 +485,8 @@ def build_nucleus_table(
         )
     else:
         assigned = assign_signal_pixels_2d(
-            segmented.nuclear_masks, signal_mask, verbose=verbose
+            segmented.nuclear_masks, signal_mask, xy_um=binned_voxel.xy_um,
+            max_distance=max_assign_distance_um, verbose=verbose,
         )
 
     # Reduce by whether the LABELS are z-consistent, not by whether Cellpose ran
@@ -411,7 +521,15 @@ def build_nucleus_table(
         voxel_um=(binned_voxel.xy_um, binned_voxel.z_um),
         masks_path=str(segmented.masks_path) if segmented.masks_path else "",
         assigned_masks_path=assigned_path,
-        params={"signal_threshold": signal_threshold, **segmented.params},
+        params={
+            "signal_threshold": signal_threshold,
+            "mask_source": mask_source,
+            "nuclei_threshold": (
+                signal_threshold if nuclei_threshold is None else nuclei_threshold
+            ),
+            "signal_mask_mode": signal_mask_mode,
+            **segmented.params,
+        },
     )
 
 
@@ -421,6 +539,8 @@ def build_cohort_tables(
     gene_volumes: Optional[Dict[str, Dict[int, np.ndarray]]] = None,
     max_assign_distance_um: Optional[float] = None,
     signal_mask_mode: str = "union",
+    mask_source: str = "genes",
+    nuclei_threshold: Optional[float] = None,
     output_root: Optional[str | Path] = None,
     verbose: bool = True,
 ) -> Tuple[List[EmbryoResult], pd.DataFrame]:
@@ -441,6 +561,8 @@ def build_cohort_tables(
                 gene_volume=(gene_volumes or {}).get(segmented.embryo_id),
                 max_assign_distance_um=max_assign_distance_um,
                 signal_mask_mode=signal_mask_mode,
+                mask_source=mask_source,
+                nuclei_threshold=nuclei_threshold,
                 verbose=verbose,
             )
         )
