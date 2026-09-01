@@ -346,15 +346,28 @@ plot_additive_gene_2d(atlas, threshold="q0.95")        # one composite
 positive_fraction(atlas, threshold=0.15)               # pick a cut without plotting
 ```
 
-Sub-threshold nuclei are **dropped** rather than greyed (`keep_silent=True` brings
-them back as context), and a nucleus is tinted only by the genes it is positive for
-(`gate_below_threshold`, on here and off in `plot_additive_2d`, which keeps the
-original notebook behaviour). Gating matters more as panels grow: with eight
-channels every atlas point carries a small non-zero value in all of them, so an
+Sub-threshold nuclei stay as grey context (`keep_silent=False` drops them, which is
+the view that makes a too-low cut obvious), and a nucleus is tinted only by the genes
+it is positive for (`gate_below_threshold`, on here and off in `plot_additive_2d`,
+which keeps the original notebook behaviour). Gating matters more as panels grow: with
+eight channels every atlas point carries a small non-zero value in all of them, so an
 ungated hue is always a blend and no threshold cleans it up. `threshold` accepts a
 number, a `{gene: cut}` mapping, the `results` dict from `call_thresholds`, `"otsu"`,
 or a positive-rate quantile like `"q0.95"`; the string forms are recomputed per
 frame, which is the point for an atlas.
+
+**How the additive colour encodes intensity.** Hue is the *intensity-weighted* mix of
+the positive channels, so a nucleus with a lot of one gene and a little of another
+lands near the strong gene's colour rather than halfway between. How saturated that
+hue is drawn then tracks the summed intensity: a barely-positive nucleus is a pale
+wash of its gene's colour, a strongly positive one is the full colour, and dot size
+and opacity follow the same total, so the three parts of the encoding agree instead of
+competing. It fades toward the theme's silent grey rather than toward white or black —
+the one target that reads as "lighter" in both themes, and it puts the palest positive
+nucleus on the same ramp as the silent tissue. `color_scale="full"` restores the older
+behaviour, where every positive nucleus is drawn at full saturation and one at 0.06
+looks exactly like one at 0.9; `min_saturation` sets how much hue the palest positive
+keeps, and `color_gamma` below 1 lifts dim nuclei.
 
 The two spaces genuinely want different numbers. Positivity is a **union** over
 channels, so adding genes to a cohort raises the fraction of nuclei that clear
@@ -381,6 +394,25 @@ domains appeared from about k=15 (median per-gene support 2–10) where k=3 gave
 median support 0–2 and no structure. `build_atlas` prints per-gene support and warns
 when a channel's median falls below 3; raise `k` until the rarest gene has a few,
 and watch the neighbour radius for the spatial smoothing that buys.
+
+**Segment once.** Cellpose only ever sees channel 0, so nothing downstream of it —
+new gene contrast, a different threshold, another reference embryo — invalidates the
+masks. `reload_segmentation` takes the run that did segment, so a notebook opened on a
+new day does not quietly want hours of Cellpose again:
+
+```python
+wf.reload_segmentation(masks_from="…/data/hcr/20260831/wt_12s_dorsal_20X")
+```
+
+```bash
+register-embryos run <nd2_dir> -o <out> --cohort <name> \
+    --masks-from <previous run>          # skips Cellpose entirely
+```
+
+The dated run root, the cohort directory, and its `embryos/` directory all resolve
+(`find_masks_dir`). The path lands in the manifest, because a run whose masks came from
+another day is not reproducible from its own directory alone. A mask whose shape or
+bin size no longer matches the volume is refused rather than combined.
 
 ## Running 3D segmentation on a GPU
 

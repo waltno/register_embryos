@@ -16,7 +16,9 @@ matplotlib.use("Agg")
 
 from register_embryos.atlas import build_atlas
 from register_embryos.plotting import (
+    DARK,
     additive_style,
+    gene_color,
     plot_additive_gene_2d,
 )
 from register_embryos.thresholds import (
@@ -215,16 +217,72 @@ def test_gating_keeps_a_single_positive_gene_pure(cohort):
         "hand2": [0.8],     # cyan  (0, 1, 1)
         "wt1a": [0.04],     # magenta, below the cut
     })
-    ungated = additive_style(df, ["hand2", "wt1a"], threshold=0.05)["rgb"][0]
-    gated = additive_style(df, ["hand2", "wt1a"], threshold=0.05,
-                           gate_below_threshold=True)["rgb"][0]
+    # color_scale="full" isolates hue from intensity, which is what this asserts.
+    style = dict(threshold=0.05, quantile_clip=1.0, color_scale="full")
+    ungated = additive_style(df, ["hand2", "wt1a"], **style)["rgb"][0]
+    gated = additive_style(df, ["hand2", "wt1a"], gate_below_threshold=True,
+                           **style)["rgb"][0]
     assert ungated[0] > 0.0          # red channel picked up from sub-threshold wt1a
     assert gated[0] == pytest.approx(0.0)
     assert gated[1] == pytest.approx(1.0) and gated[2] == pytest.approx(1.0)
 
 
-def test_sub_threshold_nuclei_are_dropped_and_can_be_kept(cohort, tmp_path):
-    """The whole point of the new figure: a silent nucleus is gone, not grey."""
+def test_hue_follows_whichever_gene_is_stronger():
+    """Two positive genes must not average to the midpoint regardless of level."""
+    df = pd.DataFrame({"hand2": [0.9, 0.1], "wt1a": [0.1, 0.9]})
+    rgb = additive_style(df, ["hand2", "wt1a"], quantile_clip=1.0,
+                         color_scale="full")["rgb"]
+    hand2_led, wt1a_led = rgb[0], rgb[1]
+    assert hand2_led[1] > hand2_led[0]   # green channel (cyan) leads
+    assert wt1a_led[0] > wt1a_led[1]     # red channel (magenta) leads
+
+
+def test_dim_positives_are_paler_and_smaller_than_bright_ones():
+    """The point of color_scale="intensity": magnitude visible in the colour."""
+    df = pd.DataFrame({"hand2": [0.06, 0.9]})
+    theme_grey = DARK.silent_rgb
+    style = additive_style(df, ["hand2"], mode="dark", quantile_clip=1.0)
+    dim, bright = style["rgb"][0], style["rgb"][1]
+
+    # "Paler" means nearer the silent grey and further from the pure hue.
+    assert np.linalg.norm(dim - theme_grey) < np.linalg.norm(bright - theme_grey)
+    assert bright == pytest.approx(gene_color("hand2", 0), abs=1e-6)
+    assert style["sizes"][0] < style["sizes"][1]
+
+
+def test_full_scale_draws_a_dim_positive_exactly_like_a_bright_one():
+    df = pd.DataFrame({"hand2": [0.06, 0.9]})
+    rgb = additive_style(df, ["hand2"], quantile_clip=1.0, color_scale="full")["rgb"]
+    assert rgb[0] == pytest.approx(rgb[1])
+
+
+def test_min_saturation_keeps_the_palest_positive_off_the_silent_grey():
+    df = pd.DataFrame({"hand2": [1e-4, 1.0]})
+    for floor in (0.05, 0.4):
+        rgb = additive_style(df, ["hand2"], mode="dark", quantile_clip=1.0,
+                             threshold=1e-5, min_saturation=floor)["rgb"]
+        assert np.linalg.norm(rgb[0] - DARK.silent_rgb) > 0.0
+    tight = additive_style(df, ["hand2"], mode="dark", quantile_clip=1.0,
+                           threshold=1e-5, min_saturation=0.05)["rgb"][0]
+    loose = additive_style(df, ["hand2"], mode="dark", quantile_clip=1.0,
+                           threshold=1e-5, min_saturation=0.4)["rgb"][0]
+    assert np.linalg.norm(loose - DARK.silent_rgb) > np.linalg.norm(tight - DARK.silent_rgb)
+
+
+def test_unknown_color_scale_is_refused():
+    with pytest.raises(ValueError, match="'intensity' or 'full'"):
+        additive_style(pd.DataFrame({"hand2": [0.5]}), ["hand2"], color_scale="hsv")
+
+
+def test_silent_nuclei_are_kept_by_default_and_can_be_dropped(cohort, tmp_path):
+    """Grey context by default; ``keep_silent=False`` is the strict view."""
+    default = plot_additive_gene_2d(
+        cohort, threshold=0.05, verbose=False, save_path=tmp_path / "default.png")
+    drawn_by_default = sum(
+        int(c.get_offsets().shape[0]) for ax in default.axes for c in ax.collections)
+    matplotlib.pyplot.close(default)
+    assert drawn_by_default == len(cohort)
+
     drawn = {}
     for keep_silent in (False, True):
         fig = plot_additive_gene_2d(
@@ -267,3 +325,43 @@ def test_an_atlas_plots_from_the_same_call(cohort, tmp_path):
 def test_unmatched_projection_names_are_an_error_not_an_empty_figure(cohort):
     with pytest.raises(ValueError, match="no panels left"):
         plot_additive_gene_2d(cohort, projections=("saggital",), verbose=False)
+
+
+# -- finding masks from an earlier run ----------------------------------------
+
+def _fake_run(root, cohort="wt_12s_dorsal_20X", embryos=("a", "b")):
+    embryos_dir = root / cohort / "embryos"
+    for embryo_id in embryos:
+        (embryos_dir / embryo_id).mkdir(parents=True)
+        (embryos_dir / embryo_id / f"{embryo_id}_nuclear_masks.npy").write_bytes(b"")
+    return embryos_dir
+
+
+@pytest.mark.parametrize("how", ["run_root", "cohort_dir", "embryos_dir"])
+def test_masks_are_found_from_any_level_of_a_previous_run(tmp_path, how):
+    """Segmentation is the expensive step; naming its output must not be fiddly."""
+    from register_embryos.workflow import find_masks_dir
+
+    embryos_dir = _fake_run(tmp_path / "20260831")
+    given = {
+        "run_root": tmp_path / "20260831",
+        "cohort_dir": embryos_dir.parent,
+        "embryos_dir": embryos_dir,
+    }[how]
+    assert find_masks_dir(given, cohort_name="wt_12s_dorsal_20X") == embryos_dir
+
+
+def test_a_run_root_without_the_cohort_name_still_resolves(tmp_path):
+    from register_embryos.workflow import find_masks_dir
+
+    embryos_dir = _fake_run(tmp_path / "20260831")
+    assert find_masks_dir(embryos_dir.parent) == embryos_dir
+
+
+def test_an_empty_run_lists_what_was_tried(tmp_path):
+    """A wrong path must not look like missing masks."""
+    from register_embryos.workflow import find_masks_dir
+
+    (tmp_path / "20260901").mkdir()
+    with pytest.raises(FileNotFoundError, match="Tried:"):
+        find_masks_dir(tmp_path / "20260901", cohort_name="wt_12s_dorsal_20X")

@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd
 
 # Safe at module level: thresholds imports plotting only lazily, inside functions.
-from .thresholds import DEFAULT_THRESHOLD
+from .thresholds import DEFAULT_THRESHOLD, resolve_gene_cuts
 
 __all__ = [
     "GENE_RGB",
@@ -191,29 +191,48 @@ def additive_style(
     size_range: Tuple[float, float] = (1.0, 14.0),
     alpha_low: float = 0.15,
     gate_below_threshold: bool = False,
+    color_scale: str = "intensity",
+    color_gamma: float = 1.0,
+    min_saturation: float = 0.18,
 ) -> Dict[str, object]:
     """Per-nucleus colour, size and opacity from the additive channel mix.
 
-    Hue comes from the channel mix normalised to full brightness, so a nucleus
-    expressing one dim gene still shows that gene's hue rather than fading to
-    black; total intensity drives size and opacity instead.  Separating hue from
-    brightness is what keeps a three-colour overlay readable.
+    Hue direction comes from the intensity-weighted channel mix, so a nucleus with
+    a lot of one gene and a little of another lands near the strong gene's hue
+    rather than halfway between.  How saturated that hue is drawn then tracks the
+    summed intensity: a barely-positive nucleus is a pale wash of its gene's colour,
+    a strongly positive one is the full colour.  Size and opacity follow the same
+    total, so the three channels of the encoding agree instead of competing.
 
     A nucleus counts as expressing when at least ONE channel clears its
     ``threshold``.  Not the channel sum: summing lets a nucleus with three
     sub-threshold channels look positive while being positive for nothing, so
     "coloured" and "positive for some gene" would stop agreeing.
 
-    ``threshold`` may be a single number or a ``{gene: cut}`` mapping -- the
-    data-driven cuts from :mod:`register_embryos.thresholds` differ per gene and per
-    embryo, and a fixed 0.05 on contrast-normalised intensity means a different
-    brightness in every embryo.
+    ``threshold`` takes anything :func:`~register_embryos.thresholds.resolve_gene_cuts`
+    takes: a number, a ``{gene: cut}`` mapping, a ``call_thresholds`` results dict,
+    ``"otsu"``, or a positive rate like ``"q0.95"``. The data-driven cuts differ per
+    gene and per embryo, and a fixed 0.05 on contrast-normalised intensity means a
+    different brightness in every embryo.
 
     Args:
         gamma: < 1 lifts dim nuclei.  0.35 is a moderate lift; the original
             notebooks used 0.1, which pushes nearly everything to full size.
         quantile_clip: intensity at this quantile of the channel sum maps to
             maximum size, so a few saturated nuclei do not flatten the rest.
+        color_scale: ``"intensity"`` (the default) fades the hue toward the theme's
+            silent grey as the summed intensity falls, so brightness carries
+            magnitude and a dim positive nucleus reads as continuous with the
+            silent tissue around it rather than as a confident call.  ``"full"``
+            restores the older behaviour -- every positive nucleus drawn at full
+            saturation whatever its intensity, which makes a nucleus at 0.06 look
+            exactly like one at 0.9.
+        color_gamma: exponent on the normalised intensity *for colour only*, kept
+            separate from ``gamma`` (which lifts dot size).  1.0 is linear, so the
+            colour does not quietly flatter weak signal; below 1 lifts dim nuclei.
+        min_saturation: how much of the hue the palest positive nucleus keeps.
+            Without a floor a just-above-threshold nucleus would be
+            indistinguishable from a silent one.
         gate_below_threshold: zero each sub-threshold channel *before* mixing, so
             only the genes a nucleus is actually positive for contribute to its hue
             and its size.  Off by default, which is what the original notebook did:
@@ -243,13 +262,10 @@ def additive_style(
 
     values = df[gene_list].fillna(0).to_numpy(dtype=float)
 
-    # threshold may be one number for every gene, or a per-gene mapping -- the
-    # data-driven cuts from register_embryos.thresholds differ per gene, and a
-    # single number cannot express that.
-    if isinstance(threshold, dict):
-        cuts = np.array([float(threshold.get(g, INTENSITY_THRESH)) for g in gene_list])
-    else:
-        cuts = np.full(len(gene_list), float(threshold))
+    # One threshold vocabulary everywhere: a number, a {gene: cut} mapping, a
+    # call_thresholds results dict, "otsu", or a rate like "q0.95".
+    resolved = resolve_gene_cuts(df, gene_list, threshold)
+    cuts = np.array([resolved[gene] for gene in gene_list])
     above = values >= cuts[None, :]
     contributing = np.where(above, values, 0.0) if gate_below_threshold else values
 
@@ -259,11 +275,26 @@ def additive_style(
 
     summed = contributing.sum(axis=1)
     ceiling = float(np.quantile(summed, quantile_clip))
-    intensity = np.clip(summed / (ceiling + 1e-9), 0, 1) ** gamma
+    normalised = np.clip(summed / (ceiling + 1e-9), 0, 1)
+    intensity = normalised ** gamma
 
     clipped = np.clip(mixed, 0, 1)
     peak = clipped.max(axis=1, keepdims=True)
     bright = clipped / np.where(peak > 1e-9, peak, 1.0)
+
+    if color_scale == "intensity":
+        # Fade toward the theme's silent grey, not toward white or black: that is
+        # the one target that reads as "lighter" in both themes, and it puts the
+        # palest positive nucleus next to the silent ones on the same ramp.
+        strength = min_saturation + (1.0 - min_saturation) * normalised ** color_gamma
+        bright = (
+            theme.silent_rgb[None, :] * (1.0 - strength[:, None])
+            + bright * strength[:, None]
+        )
+    elif color_scale != "full":
+        raise ValueError(
+            f"color_scale must be 'intensity' or 'full', got {color_scale!r}"
+        )
 
     hi_mask = above.any(axis=1)
     rgb = np.where(hi_mask[:, None], bright, theme.silent_rgb[None, :])
@@ -715,7 +746,7 @@ def plot_additive_gene_2d(
     mode: str = "dark",
     coords: Optional[Sequence[str]] = None,
     require: str = "any",
-    keep_silent: bool = False,
+    keep_silent: bool = True,
     projections: Sequence[str] = ("XY",),
     n_cols: Optional[int] = None,
     label: Optional[str] = None,
@@ -724,6 +755,7 @@ def plot_additive_gene_2d(
     quantile_clip: float = 0.95,
     size_range: Tuple[float, float] = (1.0, 14.0),
     gate_below_threshold: bool = True,
+    style_kwargs: Optional[Dict[str, object]] = None,
     save_path: Optional[str | Path] = None,
     verbose: bool = True,
     **plot_kwargs,
@@ -745,10 +777,12 @@ def plot_additive_gene_2d(
     positive. Adding genes to the panel pushes the same way, because positivity is a
     union over channels and the signal mask is too.
 
-    Unlike :func:`plot_additive_2d`, sub-threshold nuclei are **dropped** rather than
-    drawn grey (``keep_silent=True`` restores them as context). Dropping is what makes
-    a too-low threshold visible: greyed-out nuclei still occupy the panel, so an
-    over-inclusive cut looks like a dense embryo either way.
+    Sub-threshold nuclei are drawn as grey context by default, which keeps the shape
+    of the embryo on the page -- without them a strict cut leaves a handful of dots
+    floating in space with no anatomy to place them against. Pass
+    ``keep_silent=False`` to drop them instead, which is the view that makes a
+    too-low threshold obvious: greyed-out nuclei still fill the panel, so an
+    over-inclusive cut can look like a healthy dense embryo either way.
 
     Args:
         source: an :class:`~register_embryos.atlas.Atlas`, a registered nucleus table
@@ -775,7 +809,11 @@ def plot_additive_gene_2d(
             wash of blended hues at every cut.
         gamma / quantile_clip / size_range: passed to :func:`additive_style`, which is
             computed on the **full** frame before dropping, so dot sizes stay
-            comparable between a thresholded figure and its ``keep_silent=True`` twin.
+            comparable between a thresholded figure and its ``keep_silent=False`` twin.
+        style_kwargs: anything else :func:`additive_style` takes -- ``color_scale``,
+            ``color_gamma``, ``min_saturation``, ``alpha_low``. A dict rather than
+            ``**kwargs`` because the loose keywords here go to
+            :func:`plot_additive_2d`.
 
     Prints the positive fraction per frame and per gene;
     :func:`~register_embryos.thresholds.positive_fraction` returns the same table
@@ -783,6 +821,7 @@ def plot_additive_gene_2d(
     """
     from .thresholds import as_frames, positive_calls, resolve_gene_cuts
 
+    style_kwargs = dict(style_kwargs or {})
     frames = as_frames(source, label=label)
     if not frames:
         raise ValueError("nothing to plot: no frames in source")
@@ -809,7 +848,7 @@ def plot_additive_gene_2d(
         style = additive_style(
             frame, gene_list, mode=mode, threshold=cuts, gamma=gamma,
             quantile_clip=quantile_clip, size_range=size_range,
-            gate_below_threshold=gate_below_threshold,
+            gate_below_threshold=gate_below_threshold, **style_kwargs,
         )
         styles[frame_label] = {
             key: (np.asarray(value)[keep] if key in ("rgb", "hex", "sizes", "alpha",

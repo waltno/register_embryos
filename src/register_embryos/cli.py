@@ -133,6 +133,11 @@ def run(
     contrast_json: Optional[Path] = typer.Option(
         None, "--contrast", help="contrast_limits.json from the widget."
     ),
+    masks_from: Optional[Path] = typer.Option(
+        None, "--masks-from",
+        help="Reuse nuclear masks from a previous run instead of running Cellpose. "
+             "Takes the dated run root, the cohort dir, or its embryos/ dir.",
+    ),
     no_auto_contrast: bool = typer.Option(
         False, "--no-auto-contrast",
         help="Fail rather than filling missing contrast limits from percentiles.",
@@ -177,6 +182,7 @@ def run(
         n_atlas_points=atlas_points,
         orientation_json=orientation_json,
         contrast_json=contrast_json,
+        masks_from=masks_from,
         auto_contrast=not no_auto_contrast,
         plot=not no_plots,
         plot_modes=tuple(plot_mode),

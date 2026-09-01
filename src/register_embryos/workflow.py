@@ -312,7 +312,11 @@ class CohortWorkflow:
         self._params.update({"segmentation_mode": mode, "diameter": diameter})
         return self.segmented
 
-    def reload_segmentation(self, verbose: bool = True) -> List[SegmentedEmbryo]:
+    def reload_segmentation(
+        self,
+        masks_from: Optional[str | Path] = None,
+        verbose: bool = True,
+    ) -> List[SegmentedEmbryo]:
         """Take the nuclear masks off disk instead of re-running Cellpose.
 
         Use this in place of :meth:`segment` when only the **gene** contrast has
@@ -326,6 +330,23 @@ class CohortWorkflow:
         matches, since a different z sampling or a canvas-resizing rotation makes them
         describe a different image.
 
+        Args:
+            masks_from: where the masks live. Defaults to this run's own output
+                directory, which only works while you keep re-running into it --
+                and the convention here puts each day's outputs under
+                ``data/hcr/<YYYYMMDD>/``, so a fresh notebook on a new day cannot
+                see yesterday's masks and would silently want Cellpose again. Point
+                this at the run that did segment and Cellpose never runs twice::
+
+                    wf.reload_segmentation(
+                        "/net/trapnell/vol1/home/waltno/lpm/data/hcr/20260831"
+                    )
+
+                Accepts the dated run root, the cohort directory inside it, or the
+                ``embryos/`` directory itself -- see :func:`find_masks_dir`. The path
+                used is recorded in the manifest, since a run whose masks came from
+                another day is not reproducible from its own directory alone.
+
         Raises:
             FileNotFoundError: if a cohort embryo has no saved masks.
         """
@@ -336,29 +357,42 @@ class CohortWorkflow:
             print("  [NOTE] pairing masks with un-adjusted volumes; "
                   "apply_prep() was not run")
 
+        embryos_dir = (
+            find_masks_dir(masks_from, cohort_name=self.cohort.name)
+            if masks_from is not None else self.output_dir / "embryos"
+        )
+
         print(f"\n{'='*72}\nRELOAD SEGMENTATION — {self.cohort.name}\n{'='*72}")
+        print(f"  masks from {embryos_dir}")
         print("  Cellpose is not re-run; only the gene channels are re-measured.")
 
         segmented: List[SegmentedEmbryo] = []
         missing: List[str] = []
         for volume in volumes:
-            embryo_dir = self.output_dir / "embryos" / volume.embryo_id
             try:
-                segmented.append(load_segmented(embryo_dir, volume, verbose=verbose))
+                segmented.append(
+                    load_segmented(embryos_dir / volume.embryo_id, volume,
+                                   verbose=verbose)
+                )
             except FileNotFoundError:
                 missing.append(volume.embryo_id)
 
         if missing:
+            available = sorted(
+                path.parent.name for path in embryos_dir.glob("*/*_nuclear_masks.npy")
+            ) if embryos_dir.is_dir() else []
             raise FileNotFoundError(
-                f"no saved masks for {len(missing)} embryo(s) under "
-                f"{self.output_dir / 'embryos'}: {missing}. Run segment() for those, "
-                f"or point output_root at the run that produced them."
+                f"no saved masks for {len(missing)} embryo(s) under {embryos_dir}: "
+                f"{missing}.\n  Masks present there: {available or 'none'}.\n"
+                f"  Run segment() for those, or pass masks_from=<the run that "
+                f"segmented them>."
             )
 
         self.segmented = segmented
         if segmented:
             self._params["segmentation_mode"] = segmented[0].mode
             self._params["masks_reloaded"] = True
+            self._params["masks_from"] = str(embryos_dir)
         return segmented
 
     def build_tables(
@@ -653,6 +687,37 @@ def _package_version() -> str:
 DEFAULT_BIN_SIZE = {"2d": 7, "2d+link": 7, "3d": 1}
 
 
+def find_masks_dir(
+    path: str | Path, cohort_name: Optional[str] = None
+) -> Path:
+    """Resolve any sensible way of naming a previous run to its ``embryos/`` directory.
+
+    Segmentation is the expensive step and its output is reusable, so the path a
+    person has to hand is whatever they happen to be looking at -- the dated run
+    root, the cohort directory inside it, or the ``embryos/`` directory itself. All
+    three resolve here rather than each caller guessing::
+
+        data/hcr/20260831                          -> .../wt_12s_dorsal_20X/embryos
+        data/hcr/20260831/wt_12s_dorsal_20X        -> .../embryos
+        data/hcr/20260831/wt_12s_dorsal_20X/embryos-> itself
+
+    Raises:
+        FileNotFoundError: with the candidates that were tried, since a wrong path
+            here otherwise looks like missing masks.
+    """
+    path = Path(path)
+    candidates = [path / "embryos", path]
+    if cohort_name:
+        candidates.insert(0, path / cohort_name / "embryos")
+    for candidate in candidates:
+        if candidate.is_dir() and any(candidate.glob("*/*_nuclear_masks.npy")):
+            return candidate
+    raise FileNotFoundError(
+        f"no saved nuclear masks under {path}. Tried: "
+        + ", ".join(str(c) for c in candidates)
+    )
+
+
 def default_bin_size(segmentation_mode: str) -> int:
     """Sensible z-binning for a segmentation mode."""
     return DEFAULT_BIN_SIZE.get(segmentation_mode, 7)
@@ -675,6 +740,7 @@ def run_cohort(
     n_atlas_points: Optional[int] = None,
     orientation_json: Optional[str | Path] = None,
     contrast_json: Optional[str | Path] = None,
+    masks_from: Optional[str | Path] = None,
     auto_contrast: bool = True,
     plot: bool = True,
     plot_modes: Sequence[str] = ("dark", "light"),
@@ -692,6 +758,12 @@ def run_cohort(
         bin_size: z-planes per bin.  ``None`` picks the right value for
             ``segmentation_mode``: 7 for 2D, and **1 for 3D**, which takes the
             whole stack unbinned.
+        masks_from: a previous run whose nuclear masks to reuse instead of running
+            Cellpose. Cellpose only ever sees channel 0, so re-tuning gene contrast
+            or changing anything downstream does not invalidate its output -- this
+            is the difference between minutes and hours per cohort. The bin size and
+            the nuclear window must match the run that produced them; a mismatch is
+            refused rather than silently combined.
     """
     workflow = CohortWorkflow.from_directory(
         input_dir, output_root=output_root, cohort=cohort, timepoint=timepoint
@@ -722,10 +794,13 @@ def run_cohort(
         auto_contrast=auto_contrast, verbose=verbose,
     )
 
-    workflow.segment(
-        mode=segmentation_mode, gpu=gpu, diameter=diameter,
-        max_workers=max_workers, verbose=verbose,
-    )
+    if masks_from is not None:
+        workflow.reload_segmentation(masks_from=masks_from, verbose=verbose)
+    else:
+        workflow.segment(
+            mode=segmentation_mode, gpu=gpu, diameter=diameter,
+            max_workers=max_workers, verbose=verbose,
+        )
     workflow.build_tables(signal_threshold=signal_threshold, verbose=verbose)
     workflow.register(
         reference_embryo_id=reference_embryo_id, n_downsample=n_downsample, verbose=verbose
