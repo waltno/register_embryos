@@ -192,6 +192,13 @@ spread for wt1a 69 → 43 px and tbx1 118 → 65 px.
 So an embryo set wrong in the widget **stays** wrong and no residual will tell you —
 check `orientation_grid(volumes, orientations)` before segmenting.
 
+**Point-to-point, not point-to-plane.** The predecessor pipeline defaulted to
+point-to-plane with normals estimated at radius 50–60. A nucleus-centroid cloud is
+not a surface: it is a slab (812 × 734 × 24 here), so **100% of estimated normals
+come out along z**. Point-to-plane measures residual along the normal, which makes
+its objective nearly blind to in-plane error — the alignment that matters. There is
+no `normal_radius` here, deliberately.
+
 `refine_with_ot=True` adds an optional bounded second stage, always a single global
 matrix. `"similarity"` was the best model (mean NN 7.13 vs 7.39); off by default, and
 it does **not** resolve the orientation ambiguity.
