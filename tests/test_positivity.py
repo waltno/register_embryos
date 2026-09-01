@@ -636,3 +636,68 @@ def test_apply_orientation_stamps_what_it_did():
     assert rotated.orientation == Orientation(xy_rotation=30.0).describe()
     # An identity orientation returns the volume untouched, so the stamp stays.
     assert apply_orientation(volume, Orientation(), verbose=False).orientation == "identity"
+
+
+# -- a check that can see what the residual cannot -----------------------------
+
+@pytest.fixture
+def two_embryo_domains():
+    """Two embryos, each with a compact wt1a domain at one end of the cloud."""
+    rng = np.random.default_rng(7)
+    frames = []
+    for embryo_id in ("a", "b"):
+        xy = rng.normal(0, 1, (600, 2)) * np.array([100.0, 70.0])
+        df = pd.DataFrame({"embryo_id": embryo_id,
+                           "x": xy[:, 0], "y": xy[:, 1], "z": rng.normal(0, 2, 600)})
+        # wt1a lives at positive x in both embryos, i.e. they agree once aligned.
+        df["wt1a"] = np.where(df["x"] > 60, 0.8, 0.0)
+        frames.append(df)
+    return pd.concat(frames, ignore_index=True)
+
+
+def test_gene_domains_expose_a_flip_the_residual_cannot(two_embryo_domains):
+    """The whole reason this check exists."""
+    from register_embryos.registration import gene_domain_agreement
+
+    aligned = two_embryo_domains.copy()
+    aligned[["x_reg", "y_reg", "z_reg"]] = aligned[["x", "y", "z"]].to_numpy()
+
+    flipped = two_embryo_domains.copy()
+    coords = np.array(flipped[["x", "y", "z"]], dtype=float)
+    is_b = (flipped["embryo_id"] == "b").to_numpy()
+    coords[is_b, :2] *= -1                      # embryo b rotated 180 degrees
+    flipped[["x_reg", "y_reg", "z_reg"]] = coords
+
+    good = gene_domain_agreement(aligned, verbose=False)
+    bad = gene_domain_agreement(flipped, verbose=False)
+    assert good.loc[0, "gene"] == "wt1a" and good.loc[0, "n_embryos"] == 2
+    assert good.loc[0, "spread_after"] < bad.loc[0, "spread_after"] / 5
+
+
+def test_a_gene_in_one_embryo_is_skipped_not_reported_as_perfect(two_embryo_domains):
+    """A single embryo has zero spread by definition, which would read as ideal."""
+    from register_embryos.registration import gene_domain_agreement
+
+    df = two_embryo_domains.copy()
+    df[["x_reg", "y_reg", "z_reg"]] = df[["x", "y", "z"]].to_numpy()
+    df["osr1"] = np.where((df["embryo_id"] == "a") & (df["x"] > 60), 0.8, np.nan)
+
+    table = gene_domain_agreement(df, verbose=False)
+    assert "wt1a" in set(table["gene"])
+    assert "osr1" not in set(table["gene"])
+
+
+def test_registration_report_warns_on_a_reversing_rotation(two_embryo_domains):
+    from register_embryos.registration import RegistrationResult, registration_report
+
+    df = two_embryo_domains.copy()
+    df[["x_reg", "y_reg", "z_reg"]] = df[["x", "y", "z"]].to_numpy()
+    flip = np.eye(4)
+    flip[0, 0] = flip[1, 1] = -1.0              # 180 degrees about z
+    result = RegistrationResult(
+        registered=df, stats=pd.DataFrame(), reference_embryo_id="a",
+        transforms={"a": np.eye(4), "b": flip},
+    )
+    report = registration_report(result, verbose=False)
+    assert any("reverses anterior-posterior" in w for w in report["warnings"])
+    assert list(report["rotations"]["embryo_id"]) == ["b"]

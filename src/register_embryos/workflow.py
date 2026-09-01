@@ -39,7 +39,7 @@ from .contrast import (
 from .imaging import EmbryoVolume, load_cohort
 from .naming import CohortKey, EmbryoName, discover_embryos, group_into_cohorts
 from .orientation import OrientationSet, apply_orientation_to_volumes
-from .registration import RegistrationResult, register_cohort
+from .registration import RegistrationResult, register_cohort, registration_report
 from .segmentation import SegmentedEmbryo, load_segmented, segment_cohort
 
 __all__ = [
@@ -152,6 +152,7 @@ class CohortWorkflow:
         self.registration: Optional[RegistrationResult] = None
         self.atlas: Optional[Atlas] = None
         self.orientations = OrientationSet()
+        self.registration_qc: Dict[str, object] = {}
         self.contrast = ContrastLimits()
         self.figures: List[Path] = []
         self._params: Dict[str, object] = {}
@@ -627,6 +628,17 @@ class CohortWorkflow:
             **icp_kwargs,
         )
         self._params["n_downsample"] = n_downsample
+
+        # Run the discriminating check automatically. The residual printed above
+        # cannot see an anterior-posterior flip -- on this cohort it scored flipped
+        # fits 6.49-8.81 px and correct ones 6.61-8.80 -- so a registration that is
+        # only checked against the residual is not checked at all.
+        self.registration_qc = registration_report(
+            self.registration,
+            threshold=self._params.get("signal_threshold", 0.05),
+            max_rotation_deg=max_rotation_deg,
+            verbose=verbose,
+        )
         return self.registration
 
     def build_atlas(

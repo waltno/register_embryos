@@ -39,6 +39,8 @@ __all__ = [
     "register_cohort",
     "icp_residuals",
     "register_frames",
+    "gene_domain_agreement",
+    "registration_report",
 ]
 
 try:  # pragma: no cover - environment dependent
@@ -863,3 +865,173 @@ def register_cohort(
         verbose=verbose,
         **icp_kwargs,
     )
+
+# ---------------------------------------------------------------------------
+# Validating a registration with something the residual cannot see
+# ---------------------------------------------------------------------------
+
+def gene_domain_agreement(
+    registered: pd.DataFrame,
+    genes: Optional[Sequence[str]] = None,
+    threshold=0.05,
+    min_positive: int = 20,
+    min_embryos: int = 2,
+    coord_cols: Sequence[str] = COORD_COLS,
+    reg_cols: Sequence[str] = REG_COLS,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """Do the same gene's domains land in the same place across embryos?
+
+    **This is a check, not an objective.** The fit uses nucleus positions only;
+    nothing here feeds back into it. The distinction matters: fitting on expression
+    would make the atlas agree with itself by construction, which is precisely the
+    thing an atlas is supposed to measure.
+
+    It exists because the residual cannot do this job. Mean nearest-neighbour
+    distance to the reference scored flipped fits at 6.49-8.81 px on this cohort and
+    correct fits at 6.61-8.80 -- indistinguishable, because a 12-somite dorsal
+    nucleus cloud is nearly a disc of revolution and fits about as well upside down.
+    Expression domains are *not* symmetric, so they separate the two cases
+    immediately: constraining the rotation cut the cohort spread of the wt1a domain
+    from 69 to 43 px and tbx1 from 118 to 65 px, while the residual barely moved.
+
+    Per gene, the positive nuclei of each embryo are reduced to one centroid, and
+    the spread is the mean distance from those centroids to their common mean. A
+    gene carried by fewer than ``min_embryos`` embryos, or with fewer than
+    ``min_positive`` positive nuclei in an embryo, is skipped rather than reported
+    from one or two points.
+
+    Returns one row per gene: embryo count, spread before and after, and the change.
+    """
+    from .thresholds import gene_columns, resolve_gene_cuts
+
+    if registered.empty:
+        return pd.DataFrame()
+    gene_list = gene_columns(registered, genes)
+    raw = [c for c in coord_cols if c in registered.columns]
+    fitted = [c for c in reg_cols if c in registered.columns]
+    if len(fitted) != 3:
+        raise ValueError(f"registered table needs {tuple(reg_cols)}; found {fitted}")
+
+    rows = []
+    for gene in gene_list:
+        raw_centroids, reg_centroids, used = [], [], []
+        for embryo_id, group in registered.groupby("embryo_id", sort=False):
+            if gene not in group.columns or group[gene].isna().all():
+                continue
+            cuts = resolve_gene_cuts(group, [gene], threshold, embryo_id=str(embryo_id))
+            positive = group[group[gene].fillna(-1) >= cuts[gene]]
+            if len(positive) < min_positive:
+                continue
+            used.append(str(embryo_id))
+            reg_centroids.append(positive[fitted].to_numpy(float).mean(axis=0))
+            if len(raw) == 3:
+                raw_centroids.append(positive[raw].to_numpy(float).mean(axis=0))
+
+        if len(used) < min_embryos:
+            continue
+
+        def spread(centroids):
+            if len(centroids) < 2:
+                return np.nan
+            points = np.asarray(centroids)
+            return float(np.linalg.norm(points - points.mean(axis=0), axis=1).mean())
+
+        before, after = spread(raw_centroids), spread(reg_centroids)
+        rows.append({
+            "gene": gene, "n_embryos": len(used),
+            "spread_before": before, "spread_after": after,
+            "change": (after - before) if np.isfinite(before) else np.nan,
+            "embryos": ",".join(e.split("_")[1] if "_" in e else e for e in used),
+        })
+
+    table = pd.DataFrame(rows)
+    if verbose and not table.empty:
+        print("  [GENE DOMAINS] cohort spread of each gene's centroid (px, lower is "
+              "better)")
+        for _, row in table.iterrows():
+            arrow = "->" if np.isfinite(row["spread_before"]) else "  "
+            print(f"    {row['gene']:8s} {row['n_embryos']} embryos: "
+                  f"{row['spread_before']:7.1f} {arrow} {row['spread_after']:7.1f}"
+                  + (f"  ({row['change']:+.1f})" if np.isfinite(row["change"]) else ""))
+        worse = table[table["change"] > 0]
+        if not worse.empty:
+            print(f"    [WARN] registration made {len(worse)} domain(s) *more* "
+                  f"scattered: {', '.join(worse['gene'])}. On a near-symmetric cloud "
+                  f"that usually means an embryo was flipped or over-rotated.")
+    return table
+
+
+def registration_report(
+    result: "RegistrationResult",
+    genes: Optional[Sequence[str]] = None,
+    threshold=0.05,
+    max_rotation_deg: float = 30.0,
+    verbose: bool = True,
+) -> Dict[str, object]:
+    """Everything needed to decide whether a registration is usable.
+
+    Three things, because no one of them is sufficient:
+
+    * **Rotation applied per embryo** -- the only signal that catches an
+      anterior-posterior flip directly. Anything past 90 degrees reverses AP;
+      anything past ``max_rotation_deg`` deserves a look at the image.
+    * **Nearest-neighbour residual** -- catches a fit that failed outright, and is
+      blind to one that succeeded upside down.
+    * **Gene-domain agreement** (:func:`gene_domain_agreement`) -- catches exactly
+      what the residual cannot, and is not used in the fit.
+
+    Returns a dict with ``rotations``, ``residuals``, ``domains`` and ``warnings``.
+    An empty ``warnings`` list is not proof of a good registration, but a non-empty
+    one is worth acting on.
+    """
+    warnings: List[str] = []
+    rotation_rows = []
+    for embryo_id, transform in result.transforms.items():
+        if embryo_id == result.reference_embryo_id:
+            continue
+        in_plane, tilt = rotation_angles(transform)
+        scales = np.linalg.svd(transform[:3, :3], compute_uv=False)
+        rotation_rows.append({
+            "embryo_id": embryo_id, "in_plane_deg": in_plane, "tilt_deg": tilt,
+            "scale_min": float(scales.min()), "scale_max": float(scales.max()),
+        })
+        if abs(in_plane) > 90:
+            warnings.append(
+                f"{embryo_id}: in-plane {in_plane:+.1f} deg reverses "
+                f"anterior-posterior"
+            )
+        elif abs(in_plane) > max_rotation_deg:
+            warnings.append(
+                f"{embryo_id}: in-plane {in_plane:+.1f} deg exceeds "
+                f"{max_rotation_deg:g} deg; check it against the image"
+            )
+    rotations = pd.DataFrame(rotation_rows)
+
+    domains = gene_domain_agreement(
+        result.registered, genes=genes, threshold=threshold, verbose=verbose
+    )
+    if not domains.empty:
+        worse = domains[domains["change"] > 0]
+        for _, row in worse.iterrows():
+            warnings.append(
+                f"{row['gene']}: cohort domain spread rose "
+                f"{row['spread_before']:.0f} -> {row['spread_after']:.0f} px"
+            )
+
+    if verbose:
+        if warnings:
+            print(f"\n  [REPORT] {len(warnings)} warning(s):")
+            for message in warnings:
+                print(f"    - {message}")
+        else:
+            print("\n  [REPORT] no warnings. Note that a clean residual cannot "
+                  "confirm anterior-posterior orientation -- check the rotations "
+                  "and the domains above, and look at the images.")
+
+    return {
+        "rotations": rotations,
+        "residuals": result.stats,
+        "domains": domains,
+        "warnings": warnings,
+    }

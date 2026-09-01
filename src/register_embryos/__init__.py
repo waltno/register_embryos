@@ -122,11 +122,13 @@ from .registration import (
     rotation_angles,
     RegistrationResult,
     icp_point_to_point,
+    gene_domain_agreement,
     icp_residuals,
     isotropic_downsample,
     pca_align,
     register_cohort,
     register_frames,
+    registration_report,
 )
 from .thresholds import (
     DEFAULT_THRESHOLD,
@@ -199,6 +201,7 @@ __all__ = [
     "DEFAULT_THRESHOLD", "gene_columns", "as_frames", "resolve_gene_cuts",
     "positive_calls", "positive_fraction",
     "find_masks_dir", "find_cohort_dir",
+    "gene_domain_agreement", "registration_report",
     # plotting
     "Theme", "DARK", "LIGHT", "theme_for", "GENE_RGB", "additive_style",
     "plot_pointcloud_3d", "plot_additive_3d", "plot_additive_2d",
