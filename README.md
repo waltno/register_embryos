@@ -253,6 +253,22 @@ each cloud's *elongation* alongside its axis: below ~1.3 the cloud is too circul
 the angle to mean anything, which is the normal case here, so treat it as a supplement
 to looking at the images rather than a replacement.
 
+**Rigid first, then a bounded refinement.** `refine_with_ot=True` adds a second
+stage whose freedom you choose, all of them a single **global** matrix — no per-point
+displacement field, so none can invent local agreement between embryos that genuinely
+differ:
+
+| `transform_model` | freedom | measured on the real cohort |
+|---|---|---|
+| `"rigid"` (default) | rotation + translation | mean NN 7.56, gene spread 40/63/52 |
+| `"similarity"` | + one uniform scale, clamped | **mean NN 7.13**, gene spread 40/**61**/**52** |
+| `"affine"` | + bounded stretch/shear | singular values clamped to `[1/max_scale, max_scale]` |
+
+`"similarity"` was the best of the three: it beat rigid-only ICP on mean NN
+(7.13 vs 7.39) and on three of four gene domains, while introducing only a **4.8%**
+scale change against a 15% cap and never approaching the rotation cap. A free-form
+non-rigid warp is deliberately not offered.
+
 **Optional OT refinement.** `refine_with_ot=True` follows ICP with soft
 optimal-transport correspondences (entropic Sinkhorn, implemented in-package — no POT
 dependency). ICP pairs each source point with one nearest target point, which is

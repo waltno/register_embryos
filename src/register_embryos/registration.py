@@ -435,6 +435,8 @@ def ot_refine(
     max_points: int = 2000,
     max_rotation_deg: Optional[float] = None,
     inplane_only: bool = False,
+    transform_model: str = "rigid",
+    max_scale: float = 1.15,
     seed: int = 42,
     verbose: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -454,9 +456,23 @@ def ot_refine(
     OT will not tell anterior from posterior either. Constrain the rotation for that
     (see :func:`icp_point_to_point`); the constraint is honoured here too.
 
-    The transform stays **rigid**. A non-rigid OT warp would align almost anything to
-    almost anything, manufacturing agreement between embryos that differ for real
-    reasons -- which is exactly what a consensus atlas must not do.
+    ``transform_model`` controls how much freedom this stage gets. Every option is a
+    single **global** matrix -- there is no per-point displacement field -- so none of
+    them can invent local agreement between embryos that genuinely differ:
+
+    ``"rigid"``
+        Rotation and translation only. The safe default.
+    ``"similarity"``
+        Adds one uniform scale, clamped to ``max_scale``. The mildest useful
+        loosening, and the one that matches the actual variation: embryos differ in
+        size and stage.
+    ``"affine"``
+        A bounded linear map -- stretch and shear -- with singular values clamped to
+        ``[1/max_scale, max_scale]`` so no axis can collapse or blow up.
+
+    A free-form non-rigid warp is deliberately not offered. It would align almost
+    anything to almost anything, manufacturing exactly the agreement a consensus
+    atlas is supposed to measure.
 
     Args:
         epsilon: entropic regularisation, in squared distance units. ``None`` sets it
@@ -464,6 +480,8 @@ def ot_refine(
             distance), which is what keeps it scale-free across cohorts.
         max_points: both clouds are uniformly subsampled to this before building the
             cost matrix, which is dense and O(n*m).
+        transform_model: ``"rigid"``, ``"similarity"`` or ``"affine"``; see above.
+        max_scale: bound on any scaling introduced by the latter two.
     """
     rng = np.random.default_rng(seed)
 
@@ -505,19 +523,68 @@ def ot_refine(
         vt[-1, :] *= -1
         rotation = vt.T @ u.T
 
+    if transform_model == "rigid":
+        linear = rotation
+    elif transform_model == "similarity":
+        # One uniform scale. Embryos differ in size and stage, and a global scale is
+        # the mildest way to absorb that -- it cannot deform anything locally.
+        variance = float((weights[:, None] * centred_src**2).sum() / weights.sum())
+        scale = float(np.trace(rotation.T @ covariance) / max(
+            variance * weights.sum(), 1e-12))
+        scale = float(np.clip(scale, 1.0 / max_scale, max_scale))
+        linear = scale * rotation
+    elif transform_model == "affine":
+        # Weighted least-squares linear map, then bounded: the singular values are
+        # clamped so the map can stretch and shear a little but never collapse or
+        # blow up an axis. Still one global matrix -- no per-point displacement --
+        # so it cannot invent local agreement between embryos.
+        gram = (centred_src * weights[:, None]).T @ centred_src
+        linear = np.linalg.solve(
+            gram + 1e-9 * np.eye(3), (centred_src * weights[:, None]).T @ centred_tgt
+        ).T
+        u_a, sv, vt_a = np.linalg.svd(linear)
+        sv = np.clip(sv, 1.0 / max_scale, max_scale)
+        linear = u_a @ np.diag(sv) @ vt_a
+        if np.linalg.det(linear) < 0:
+            u_a[:, -1] *= -1
+            linear = u_a @ np.diag(sv) @ vt_a
+    else:
+        raise ValueError(
+            f"unknown transform_model {transform_model!r} "
+            f"(expected 'rigid', 'similarity' or 'affine')"
+        )
+
     transform = np.eye(4)
-    transform[:3, :3] = rotation
-    transform[:3, 3] = tgt_c - rotation @ src_c
-    transform = _constrain_rotation(
-        transform, source.mean(axis=0), max_rotation_deg, inplane_only
-    )
+    transform[:3, :3] = linear
+    transform[:3, 3] = tgt_c - linear @ src_c
+    # The rotation cap applies to the rotational part only; a similarity or affine
+    # map is decomposed, capped, and reassembled with its scale intact.
+    if max_rotation_deg is not None or inplane_only:
+        u_c, sv_c, vt_c = np.linalg.svd(transform[:3, :3])
+        pure_rotation = u_c @ vt_c
+        if np.linalg.det(pure_rotation) < 0:
+            u_c[:, -1] *= -1
+            pure_rotation = u_c @ vt_c
+        rot_only = np.eye(4)
+        rot_only[:3, :3] = pure_rotation
+        capped = _constrain_rotation(
+            rot_only, source.mean(axis=0), max_rotation_deg, inplane_only
+        )
+        stretch = vt_c.T @ np.diag(sv_c) @ vt_c        # symmetric positive part
+        linear = capped[:3, :3] @ stretch
+        transform = np.eye(4)
+        transform[:3, :3] = linear
+        transform[:3, 3] = tgt_c - linear @ src_c
 
     if verbose:
         before = float(cKDTree(target).query(source)[0].mean())
         after = float(cKDTree(target).query(_apply_transform(source, transform))[0].mean())
         in_plane, tilt = rotation_angles(transform)
-        print(f"    [OT] epsilon={epsilon:.2f}  mean NN {before:.3f} -> {after:.3f}  "
-              f"(extra in-plane {in_plane:+.2f} deg, tilt {tilt:.2f} deg)")
+        scales = np.linalg.svd(transform[:3, :3], compute_uv=False)
+        print(f"    [OT] {transform_model}, epsilon={epsilon:.2f}  "
+              f"mean NN {before:.3f} -> {after:.3f}  "
+              f"(extra in-plane {in_plane:+.2f} deg, tilt {tilt:.2f} deg, "
+              f"scale {scales.min():.3f}-{scales.max():.3f})")
     return _apply_transform(source, transform), transform
 
 
@@ -591,6 +658,7 @@ def register_frames(
     refine_with_ot: bool = False,
     ot_max_rotation_deg: float = 5.0,
     ot_kwargs: Optional[Dict[str, object]] = None,
+    coord_cols: Sequence[str] = COORD_COLS,
     verbose: bool = True,
     **icp_kwargs,
 ) -> RegistrationResult:
@@ -608,9 +676,15 @@ def register_frames(
             uniformly sampled clouds is both faster and less biased toward dense
             regions).
         refine_with_ot: after ICP, refine with soft optimal-transport
-            correspondences (:func:`ot_refine`).  Still rigid, and capped tightly by
+            correspondences (:func:`ot_refine`).  Capped tightly by
             ``ot_max_rotation_deg`` -- it is a refinement, not a second chance to
             re-orient.
+        coord_cols: which columns to register on.  The default ``("x", "y", "z")``
+            mixes units -- xy in pixels, z in bin indices -- so with this project's
+            geometry z contributes only about 1.5% of the cost and ICP effectively
+            ignores it.  Pass ``("x_um", "y_um", "z_um")`` to register in
+            micrometres, where z is ~16%; that is also the only version in which a
+            rotation matrix means a physical rotation rather than a shear.
         center_first: translate each cloud onto the reference centroid before
             ICP.  Useful for atlas-to-atlas alignment where the two clouds may
             sit in unrelated coordinate ranges.
@@ -621,7 +695,7 @@ def register_frames(
     ot_kwargs = dict(ot_kwargs or {})
     tables = {
         embryo_id: (
-            isotropic_downsample(df, n_target=n_downsample)
+            isotropic_downsample(df, n_target=n_downsample, coord_cols=coord_cols)
             if n_downsample and len(df) > n_downsample
             else df.reset_index(drop=True)
         )
@@ -638,7 +712,7 @@ def register_frames(
             f"reference {reference_embryo_id!r} not among {list(tables)}"
         )
 
-    reference_cloud = tables[reference_embryo_id][list(COORD_COLS)].to_numpy(dtype=float)
+    reference_cloud = tables[reference_embryo_id][list(coord_cols)].to_numpy(dtype=float)
     backend = "open3d" if HAS_OPEN3D else "numpy"
     if verbose:
         print(
@@ -650,7 +724,7 @@ def register_frames(
     transforms: Dict[str, np.ndarray] = {}
 
     for embryo_id, df in tables.items():
-        cloud = df[list(COORD_COLS)].to_numpy(dtype=float)
+        cloud = df[list(coord_cols)].to_numpy(dtype=float)
         if len(cloud) < 3:
             print(f"    [SKIP] {embryo_id}: fewer than 3 nuclei")
             continue

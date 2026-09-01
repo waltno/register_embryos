@@ -1220,3 +1220,111 @@ def test_orientation_consistency_reports_low_elongation_as_unreliable(capsys):
     out = orientation_consistency(pd.concat(frames, ignore_index=True), verbose=True)
     assert (out["elongation"] < 1.3).all()
     assert "cannot settle orientation" in capsys.readouterr().out
+
+
+def test_ot_similarity_absorbs_a_size_difference_within_its_cap():
+    """The bounded loosening: one global scale, clamped, no local warp."""
+    from register_embryos.registration import ot_refine
+
+    target = _disc_cloud(seed=10)
+    source = target * 1.08 + np.array([10.0, 5.0, 0.3])     # 8% larger
+
+    _, rigid = ot_refine(source, target, max_points=500,
+                         transform_model="rigid", verbose=False)
+    _, similar = ot_refine(source, target, max_points=500,
+                           transform_model="similarity", max_scale=1.15, verbose=False)
+    rigid_scale = np.linalg.svd(rigid[:3, :3], compute_uv=False)
+    similar_scale = np.linalg.svd(similar[:3, :3], compute_uv=False)
+
+    assert rigid_scale.max() == pytest.approx(1.0, abs=1e-6)   # rigid cannot scale
+    assert similar_scale.max() < 1.0                            # shrinks toward target
+    # One uniform scale: every singular value the same.
+    assert similar_scale.max() - similar_scale.min() < 1e-6
+
+
+def test_ot_scale_is_clamped():
+    from register_embryos.registration import ot_refine
+
+    target = _disc_cloud(seed=11)
+    source = target * 2.0            # far outside any sane bound
+    _, transform = ot_refine(source, target, max_points=500,
+                             transform_model="similarity", max_scale=1.05,
+                             verbose=False)
+    scales = np.linalg.svd(transform[:3, :3], compute_uv=False)
+    assert scales.max() <= 1.05 + 1e-6
+    assert scales.min() >= 1 / 1.05 - 1e-6
+
+
+def test_ot_affine_singular_values_are_bounded():
+    from register_embryos.registration import ot_refine
+
+    target = _disc_cloud(seed=12)
+    source = target * np.array([1.4, 0.7, 1.0])      # anisotropic distortion
+    _, transform = ot_refine(source, target, max_points=500,
+                             transform_model="affine", max_scale=1.10, verbose=False)
+    scales = np.linalg.svd(transform[:3, :3], compute_uv=False)
+    assert scales.max() <= 1.10 + 1e-6
+    assert scales.min() >= 1 / 1.10 - 1e-6
+    assert np.linalg.det(transform[:3, :3]) > 0      # no reflection
+
+
+def test_ot_rejects_an_unknown_transform_model():
+    from register_embryos.registration import ot_refine
+
+    with pytest.raises(ValueError, match="unknown transform_model"):
+        ot_refine(_disc_cloud(seed=13), _disc_cloud(seed=14),
+                  max_points=200, transform_model="elastic", verbose=False)
+
+
+def _units_cohort():
+    rng = np.random.default_rng(15)
+    frames = {}
+    for name, shift in (("ref", 0.0), ("mov", 3.0)):
+        cloud = rng.normal(0, 1, (900, 3)) * np.array([180.0, 155.0, 4.0])
+        df = pd.DataFrame(cloud, columns=["x", "y", "z"])
+        df["z"] += shift                       # a pure z offset, in bins
+        df["embryo_id"] = name
+        df["x_um"] = df["x"] * 0.863
+        df["y_um"] = df["y"] * 0.863
+        df["z_um"] = df["z"] * 10.5            # bin thickness
+        frames[name] = df
+    return frames
+
+
+def test_coord_cols_selects_which_columns_are_registered():
+    """Registering in physical units is a different problem, not a rescaled one.
+
+    The default ("x", "y", "z") mixes units -- xy in pixels, z in bin indices -- so on
+    this project's geometry z contributes ~1.5% of the cost and ICP nearly ignores it;
+    in micrometres it is ~16%. That changes the fit. It does NOT follow that the
+    micrometre fit is better, and on this fixture it is not (it recovers the z offset
+    slightly less well), so this test pins the mechanism only.
+    """
+    from register_embryos.registration import register_frames
+
+    frames = _units_cohort()
+    in_px = register_frames(frames, reference_embryo_id="ref", n_downsample=None,
+                            pca_init=False, verbose=False)
+    in_um = register_frames(frames, reference_embryo_id="ref", n_downsample=None,
+                            pca_init=False, coord_cols=("x_um", "y_um", "z_um"),
+                            verbose=False)
+    # Different cost function -> different transform.
+    assert not np.allclose(in_px.transform_of("mov"), in_um.transform_of("mov"))
+    # Both still recover most of the 3-bin z offset, in their own units.
+    assert abs(in_px.transform_of("mov")[2, 3]) > 1.5
+    assert abs(in_um.transform_of("mov")[2, 3]) / 10.5 > 1.5
+    # Output columns are always x_reg/y_reg/z_reg, in whatever units were registered.
+    assert {"x_reg", "y_reg", "z_reg"} <= set(in_um.registered.columns)
+
+
+def test_z_share_of_the_cost_differs_by_the_anisotropy():
+    """The measurable claim: what fraction of the coordinate range z accounts for."""
+    frames = _units_cohort()
+    df = frames["ref"]
+    spans_px = np.array([df[c].max() - df[c].min() for c in ("x", "y", "z")])
+    spans_um = np.array([df[c].max() - df[c].min() for c in ("x_um", "y_um", "z_um")])
+    share_px = spans_px[2] / spans_px.sum()
+    share_um = spans_um[2] / spans_um.sum()
+    assert share_px < 0.05          # z is negligible in mixed units
+    assert share_um > 0.10          # and material in physical ones
+    assert share_um / share_px > 5

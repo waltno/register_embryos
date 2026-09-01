@@ -188,3 +188,64 @@ def test_colours_stay_matched_to_their_rows_after_slicing():
     # Positional alignment: mask[i] must describe row i of the slice.
     assert np.allclose(style["rgb"][positive][0], GENE_RGB["hand2"])
     assert style["hi_mask"].tolist() == positive.tolist()
+
+
+# ---------------------------------------------------------------------------
+# Per-embryo gene grid
+# ---------------------------------------------------------------------------
+
+def _mixed_panel_cohort():
+    """A cohort where the gene panel differs per embryo, as a real one does."""
+    rng = np.random.default_rng(2)
+    frames = []
+    panels = {"e0": ["hand2", "wt1a"], "e1": ["hand2", "tbx1"], "e2": ["wt1a", "pax2a"]}
+    for name, genes in panels.items():
+        df = pd.DataFrame(rng.normal(0, 100, (200, 3)), columns=["x", "y", "z"])
+        df["embryo_id"] = name
+        df[["x_reg", "y_reg", "z_reg"]] = df[["x", "y", "z"]]
+        for gene in ("hand2", "wt1a", "tbx1", "pax2a"):
+            # np.nan for a gene this embryo was not stained for.
+            df[gene] = np.where(df["x"] > 0, 0.6, 0.0) if gene in genes else np.nan
+        frames.append(df)
+    return pd.concat(frames, ignore_index=True)
+
+
+def test_gene_by_embryo_renders_a_mixed_panel_cohort(tmp_path):
+    from register_embryos.plotting import plot_gene_by_embryo
+
+    path = tmp_path / "grid.png"
+    plot_gene_by_embryo(_mixed_panel_cohort(), mode="light", save_path=path)
+    assert path.exists() and path.stat().st_size > 0
+
+
+def test_gene_by_embryo_marks_absent_genes_rather_than_drawing_nothing():
+    """A blank axis is ambiguous; 'not in panel' is not."""
+    from register_embryos.plotting import plot_gene_by_embryo
+
+    fig = plot_gene_by_embryo(_mixed_panel_cohort(), mode="light")
+    texts = [t.get_text() for ax in fig.axes for t in ax.texts]
+    assert "not in panel" in texts
+
+
+def test_gene_by_embryo_accepts_per_embryo_thresholds():
+    """The cuts from call_thresholds are keyed (embryo, gene); both forms must work."""
+    from register_embryos.plotting import plot_gene_by_embryo
+    from register_embryos.thresholds import call_thresholds
+
+    table = _mixed_panel_cohort()
+    results, _ = call_thresholds(table, genes=["hand2", "wt1a"], verbose=False)
+    assert plot_gene_by_embryo(table, genes=["hand2", "wt1a"], mode="light",
+                               threshold=results) is not None
+    assert plot_gene_by_embryo(table, genes=["hand2", "wt1a"], mode="light",
+                               threshold={"hand2": 0.3, "wt1a": 0.1}) is not None
+    assert plot_gene_by_embryo(table, genes=["hand2"], mode="light",
+                               threshold=0.05) is not None
+
+
+def test_gene_by_embryo_prefers_registered_coordinates():
+    from register_embryos.plotting import plot_gene_by_embryo
+
+    table = _mixed_panel_cohort()
+    table[["x_reg", "y_reg", "z_reg"]] = table[["x", "y", "z"]] + 500
+    fig = plot_gene_by_embryo(table, genes=["hand2"], mode="light")
+    assert fig.axes[0].get_xlim()[1] > 300

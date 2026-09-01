@@ -108,6 +108,7 @@ from .plotting import (
     additive_style,
     plot_additive_2d,
     plot_additive_3d,
+    plot_gene_by_embryo,
     plot_gene_panels_2d,
     plot_pointcloud_3d,
     plot_registration_2d,
@@ -182,7 +183,7 @@ __all__ = [
     # plotting
     "Theme", "DARK", "LIGHT", "theme_for", "GENE_RGB", "additive_style",
     "plot_pointcloud_3d", "plot_additive_3d", "plot_additive_2d",
-    "plot_gene_panels_2d", "plot_registration_2d",
+    "plot_gene_panels_2d", "plot_gene_by_embryo", "plot_registration_2d",
     # workflow
     "CohortWorkflow", "CohortOutputs", "run_cohort", "run_all_cohorts", "scan",
 ]

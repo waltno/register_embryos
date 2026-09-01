@@ -43,6 +43,7 @@ __all__ = [
     "plot_additive_2d",
     "plot_registration_2d",
     "plot_gene_panels_2d",
+    "plot_gene_by_embryo",
 ]
 
 #: Default hues for the genes in this project's panels.  Chosen to stay
@@ -712,7 +713,134 @@ def plot_gene_panels_2d(
 
     if suptitle:
         fig.suptitle(suptitle, color=theme.font, fontsize=12)
-    fig.tight_layout()
+        fig.tight_layout(rect=(0, 0, 1, 0.97))
+    else:
+        fig.tight_layout()
+    _save_fig(fig, theme, save_path)
+    return fig
+
+
+def plot_gene_by_embryo(
+    registered: pd.DataFrame,
+    genes: Optional[Sequence[str]] = None,
+    mode: str = "light",
+    coords: Optional[Sequence[str]] = None,
+    projection: Tuple[int, int] = (0, 1),
+    threshold=INTENSITY_THRESH,
+    suptitle: str = "",
+    panel_size: float = 2.9,
+    point_size: float = 5.0,
+    quantile_cap: float = 0.99,
+    shared_scale: bool = True,
+    z_aspect: Optional[float] = None,
+    save_path: Optional[str | Path] = None,
+):
+    """Grid of embryos (rows) x genes (columns) in registered space.
+
+    The view for judging a registration by the thing you actually care about, one
+    embryo at a time, *before* the atlas averages them together. An atlas hides
+    disagreement by construction -- it takes a mean -- so a domain that lands in a
+    different place in one embryo shows up here and nowhere later.
+
+    A gene absent from an embryo's panel leaves its cell blank rather than an empty
+    axis, which keeps the rows readable when panels differ across the cohort (as they
+    do whenever a rotating-partner design is used).
+
+    Args:
+        threshold: a scalar, or a ``{gene: cut}`` mapping, or the ``results`` dict
+            from :func:`~register_embryos.thresholds.call_thresholds` (per-embryo cuts
+            are then used for the matching embryo).
+        shared_scale: put every embryo on one colour scale per gene, so panels are
+            comparable down a column. Off scales each panel to its own maximum, which
+            shows the pattern in a dim embryo at the cost of comparability.
+    """
+    import matplotlib
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap
+
+    matplotlib.rcParams["pdf.fonttype"] = 42
+    theme = theme_for(mode)
+    coord_cols = _resolve_coords(registered, coords)
+    cx, cy = coord_cols[projection[0]], coord_cols[projection[1]]
+    gene_list = _resolve_genes(registered, genes)
+    embryos = list(registered["embryo_id"].unique())
+
+    def cut_for(embryo_id: str, gene: str) -> float:
+        if isinstance(threshold, dict):
+            keyed = threshold.get((embryo_id, gene))
+            if keyed is not None:
+                return float(getattr(keyed, "threshold", keyed))
+            plain = threshold.get(gene)
+            if plain is not None:
+                return float(getattr(plain, "threshold", plain))
+            return INTENSITY_THRESH
+        return float(threshold)
+
+    caps = {}
+    for gene in gene_list:
+        values = registered[gene].dropna()
+        caps[gene] = float(values.quantile(quantile_cap)) if len(values) else 1.0
+
+    fig, axes = plt.subplots(
+        len(embryos), len(gene_list),
+        figsize=(panel_size * len(gene_list), panel_size * len(embryos)),
+        facecolor=theme.paper, squeeze=False,
+    )
+    for row, embryo_id in enumerate(embryos):
+        sub = registered[registered["embryo_id"] == embryo_id]
+        for col, gene in enumerate(gene_list):
+            ax = axes[row][col]
+            ax.set_facecolor(theme.paper)
+            values = sub[gene]
+            if values.isna().all():
+                # Not in this embryo's panel: say so instead of drawing an empty box.
+                ax.text(0.5, 0.5, "not in panel", ha="center", va="center",
+                        transform=ax.transAxes, color=theme.axis_label, fontsize=8)
+                ax.set_xticks([]); ax.set_yticks([])
+                for spine in ax.spines.values():
+                    spine.set_color(theme.grid)
+                if row == 0:
+                    ax.set_title(gene, color=theme.font, fontsize=10)
+                continue
+
+            cut = cut_for(embryo_id, gene)
+            filled = values.fillna(0).to_numpy()
+            positive = filled >= cut
+            x_all, y_all = sub[cx].to_numpy(), sub[cy].to_numpy()
+
+            ax.scatter(x_all[~positive], y_all[~positive], c=[theme.silent_rgb],
+                       s=point_size * 0.45, alpha=0.35, rasterized=True, linewidths=0)
+            if positive.any():
+                cmap = LinearSegmentedColormap.from_list(
+                    f"{gene}_ramp",
+                    [_hex(theme.silent_rgb), _hex(gene_color(gene, col))],
+                )
+                cap = caps[gene] if shared_scale else float(filled[positive].max())
+                ax.scatter(x_all[positive], y_all[positive], c=filled[positive],
+                           cmap=cmap, vmin=cut, vmax=max(cap, cut + 1e-6),
+                           s=point_size, alpha=0.95, rasterized=True,
+                           linewidths=0.15,
+                           edgecolors=matplotlib.colors.to_rgba(theme.stroke, 0.5))
+
+            _style_axes(ax, theme, cx, cy, "", z_aspect=z_aspect)
+            ax.set_xlabel(""); ax.set_ylabel("")
+            ax.set_xticks([]); ax.set_yticks([])
+            n_pos = int(positive.sum())
+            ax.text(0.02, 0.98, f"{n_pos:,}  ({n_pos/len(sub):.0%})",
+                    transform=ax.transAxes, va="top", ha="left",
+                    color=theme.font, fontsize=7)
+            if row == 0:
+                ax.set_title(gene, color=theme.font, fontsize=10)
+
+        short = embryo_id.split("_")
+        axes[row][0].set_ylabel("_".join(short[:2]), color=theme.font, fontsize=7)
+
+    if suptitle:
+        fig.suptitle(suptitle, color=theme.font, fontsize=12)
+        # Reserve space, or the suptitle lands on top of the first row's titles.
+        fig.tight_layout(rect=(0, 0, 1, 0.98 if len(embryos) > 3 else 0.95))
+    else:
+        fig.tight_layout()
     _save_fig(fig, theme, save_path)
     return fig
 
@@ -779,6 +907,8 @@ def plot_registration_2d(
 
     if suptitle:
         fig.suptitle(suptitle, color=theme.font, fontsize=12)
-    fig.tight_layout()
+        fig.tight_layout(rect=(0, 0, 1, 0.97))
+    else:
+        fig.tight_layout()
     _save_fig(fig, theme, save_path)
     return fig
