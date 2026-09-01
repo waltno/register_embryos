@@ -222,6 +222,29 @@ the 0.05 signal threshold**, so essentially every nucleus read as expressing.
 fraction per channel and warns above 25 %, so a bad automatic choice is visible
 rather than silent — but this is still the reason to use the widget.
 
+**Re-tuning gene contrast without re-running Cellpose.** Segmentation only ever
+looks at channel 0, so a new contrast window on a *gene* channel does not invalidate
+the masks — only the signal mask and the per-nucleus means downstream. `load_segmented()`
+reloads saved masks and pairs them with a freshly contrasted volume, turning a
+15-minutes-per-embryo re-run into about two:
+
+```python
+vol = load_embryo(nd2, bin_size=7)
+vol = apply_orientation(vol, orientations.get(vol.embryo_id))
+vol = apply_contrast_to_volumes([vol], new_contrast)[0]
+seg = load_segmented(out / "embryos" / vol.embryo_id, vol)
+result = build_nucleus_table(seg)
+```
+
+**Gene channels are coupled under the default signal mask.** The mask is a union over
+gene channels, so a pixel counts as measured for *every* gene wherever *any* gene had
+signal. Consequence, measured on a real embryo: raising the hand2 and wt1a contrast
+floors moved **tbx1 from 20.4% to 24.2% positive with tbx1's own window untouched**. So
+gene contrast cannot be tuned one channel at a time — re-check every channel after
+changing any of them. `signal_mask_mode="per_channel"` decouples them (each gene is
+measured only where it clears its own threshold), at the cost of reading more binary
+for graded low-level expression. The union mask still decides territory in both modes.
+
 **Why registration downsamples uniformly in space.** Uniform-at-random sampling
 keeps dense regions dense, and ICP then fits the dense regions and ignores the
 sparse ones. `isotropic_downsample` normalises each axis to [0,1] first, so z (a

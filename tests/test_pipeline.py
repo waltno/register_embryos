@@ -1328,3 +1328,53 @@ def test_z_share_of_the_cost_differs_by_the_anisotropy():
     assert share_px < 0.05          # z is negligible in mixed units
     assert share_um > 0.10          # and material in physical ones
     assert share_um / share_px > 5
+
+
+def test_union_signal_mask_couples_the_gene_channels():
+    """One gene's contrast changes another gene's measured value, under "union".
+
+    Observed on real data: raising the hand2 and wt1a floors moved tbx1 from 20.4%
+    to 24.2% positive with tbx1's own window untouched. "per_channel" decouples them.
+    """
+    from register_embryos.assignment import BACKGROUND_VALUE, _apply_background
+
+    # geneA is bright in the left half; geneB is background everywhere.
+    bright = np.zeros((1, 4, 4), np.float32)
+    bright[0, :, :2] = 0.8
+    background = np.full((1, 4, 4), 0.02, np.float32)
+    channels = {0: np.ones((1, 4, 4), np.float32), 1: bright, 2: background}
+
+    from register_embryos.assignment import build_signal_mask
+
+    mask = build_signal_mask(channels, signal_threshold=0.05, verbose=False)
+
+    union = _apply_background(channels, mask, mode="union")
+    per_channel = _apply_background(channels, mask, mode="per_channel",
+                                    signal_threshold=0.05)
+
+    # Under union, geneB's background is retained wherever geneA was bright, so it
+    # counts as a measurement.
+    assert (union[2][0, :, :2] != BACKGROUND_VALUE).all()
+    # Under per_channel it is not, because geneB never cleared its own threshold.
+    assert (per_channel[2] == BACKGROUND_VALUE).all()
+    # geneA is unaffected either way.
+    assert (union[1][0, :, :2] == per_channel[1][0, :, :2]).all()
+
+
+def test_per_channel_mode_leaves_the_nuclear_channel_on_the_union():
+    from register_embryos.assignment import BACKGROUND_VALUE, _apply_background
+
+    channels = {0: np.full((1, 3, 3), 0.9, np.float32),
+                1: np.full((1, 3, 3), 0.02, np.float32)}
+    mask = np.ones((1, 3, 3), dtype=bool)
+    out = _apply_background(channels, mask, mode="per_channel", signal_threshold=0.05)
+    assert (out[0] != BACKGROUND_VALUE).all()      # channel 0 follows the mask
+    assert (out[1] == BACKGROUND_VALUE).all()      # the dim gene does not
+
+
+def test_unknown_signal_mask_mode_is_rejected():
+    from register_embryos.assignment import _apply_background
+
+    with pytest.raises(ValueError, match="unknown signal_mask_mode"):
+        _apply_background({1: np.zeros((1, 2, 2), np.float32)},
+                          np.ones((1, 2, 2), dtype=bool), mode="intersection")

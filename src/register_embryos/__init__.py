@@ -137,6 +137,7 @@ from .thresholds import (
 )
 from .segmentation import (
     SegmentedEmbryo,
+    load_segmented,
     relabel_3d_from_2d,
     segment_2d,
     segment_3d,
@@ -166,7 +167,7 @@ __all__ = [
     "PrepConfig", "prepare_widget", "orientation_widget",
     # segmentation
     "SegmentedEmbryo", "segment_2d", "segment_3d", "segment_embryo",
-    "segment_cohort", "relabel_3d_from_2d",
+    "segment_cohort", "relabel_3d_from_2d", "load_segmented",
     # assignment
     "BACKGROUND_VALUE", "EmbryoResult", "build_signal_mask",
     "assign_signal_pixels_2d", "assign_signal_pixels_3d", "nucleus_table",

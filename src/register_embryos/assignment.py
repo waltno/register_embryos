@@ -106,13 +106,43 @@ def build_signal_mask(
 
 
 def _apply_background(
-    channels: Dict[int, np.ndarray], signal_mask: np.ndarray
+    channels: Dict[int, np.ndarray],
+    signal_mask: np.ndarray,
+    mode: str = "union",
+    signal_threshold: float = 0.05,
+    nuclei_channel: int = 0,
 ) -> Dict[int, np.ndarray]:
-    """Copy channels with no-signal pixels replaced by ``BACKGROUND_VALUE``."""
+    """Mark which pixels count as a measurement, per channel.
+
+    ``mode="union"`` (the original behaviour) keeps a pixel for **every** channel
+    wherever **any** gene channel had signal. That couples the channels: a nucleus
+    sitting in a region that is bright in wt1a has its hand2 value averaged over
+    those pixels too, whether or not hand2 is on there. Observed consequence --
+    raising the hand2 and wt1a contrast floors on one real embryo moved *tbx1* from
+    20.4% to 24.2% positive without tbx1's own window changing at all. So gene
+    contrast cannot be tuned one channel at a time under this rule.
+
+    ``mode="per_channel"`` keeps a pixel for a given gene only where that gene itself
+    clears the threshold, which decouples them: each gene's numbers then depend only
+    on its own window. The trade is that a gene's mean is taken over its own positive
+    pixels only, which pushes low-level graded expression toward either the threshold
+    or zero -- it reads more binary.
+
+    The union mask still decides *territory* (which nucleus a pixel belongs to) in
+    both modes; this only governs what is treated as measured.
+    """
     filtered: Dict[int, np.ndarray] = {}
     for index, data in channels.items():
         copy = data.copy()
-        copy[~signal_mask] = BACKGROUND_VALUE
+        if mode == "union" or index == nuclei_channel:
+            keep = signal_mask
+        elif mode == "per_channel":
+            keep = data > signal_threshold
+        else:
+            raise ValueError(
+                f"unknown signal_mask_mode {mode!r} (expected 'union' or 'per_channel')"
+            )
+        copy[~keep] = BACKGROUND_VALUE
         filtered[index] = copy
     return filtered
 
@@ -303,6 +333,7 @@ def build_nucleus_table(
     signal_threshold: float = 0.05,
     gene_volume: Optional[Dict[int, np.ndarray]] = None,
     max_assign_distance_um: Optional[float] = None,
+    signal_mask_mode: str = "union",
     save: bool = True,
     verbose: bool = True,
 ) -> EmbryoResult:
@@ -312,6 +343,9 @@ def build_nucleus_table(
         gene_volume: replacement channel arrays for the gene channels, letting
             contrast be re-tuned for channels 1+ without re-running Cellpose.
             The nuclear channel always comes from ``segmented``.
+        signal_mask_mode: ``"union"`` or ``"per_channel"``; see
+            :func:`_apply_background`. Use ``"per_channel"`` to make each gene's
+            values depend only on its own contrast window.
     """
     volume = segmented.volume
     channels = dict(segmented.adjusted_channels)
@@ -326,7 +360,10 @@ def build_nucleus_table(
     signal_mask = build_signal_mask(
         channels, signal_threshold=signal_threshold, verbose=verbose
     )
-    channels_filtered = _apply_background(channels, signal_mask)
+    channels_filtered = _apply_background(
+        channels, signal_mask, mode=signal_mask_mode,
+        signal_threshold=signal_threshold,
+    )
 
     binned_voxel = volume.binned_voxel
     if segmented.is_3d:
@@ -383,6 +420,7 @@ def build_cohort_tables(
     signal_threshold: float = 0.05,
     gene_volumes: Optional[Dict[str, Dict[int, np.ndarray]]] = None,
     max_assign_distance_um: Optional[float] = None,
+    signal_mask_mode: str = "union",
     output_root: Optional[str | Path] = None,
     verbose: bool = True,
 ) -> Tuple[List[EmbryoResult], pd.DataFrame]:
@@ -402,6 +440,7 @@ def build_cohort_tables(
                 signal_threshold=signal_threshold,
                 gene_volume=(gene_volumes or {}).get(segmented.embryo_id),
                 max_assign_distance_um=max_assign_distance_um,
+                signal_mask_mode=signal_mask_mode,
                 verbose=verbose,
             )
         )

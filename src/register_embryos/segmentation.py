@@ -45,6 +45,7 @@ __all__ = [
     "segment_3d",
     "segment_embryo",
     "segment_cohort",
+    "load_segmented",
     "relabel_3d_from_2d",
 ]
 
@@ -521,6 +522,81 @@ def segment_embryo(
             "gpu": gpu,
             **kwargs,
         },
+    )
+
+
+def load_segmented(
+    embryo_dir: str | Path,
+    volume: EmbryoVolume,
+    verbose: bool = True,
+) -> SegmentedEmbryo:
+    """Rebuild a :class:`SegmentedEmbryo` from masks already on disk.
+
+    Cellpose only ever looks at channel 0. So re-tuning the contrast of a *gene*
+    channel does not invalidate the segmentation -- only the signal mask, the pixel
+    assignment and the per-nucleus means downstream of it. Re-running Cellpose for
+    that is hours of work for no change in its output.
+
+    This reloads the saved masks and pairs them with a freshly contrasted volume, so
+    the cheap half of the pipeline can be redone on its own::
+
+        vol = load_embryo(nd2, bin_size=7)
+        vol = apply_orientation(vol, orientations.get(vol.embryo_id))
+        vol = apply_contrast_to_volumes([vol], new_contrast)[0]   # new gene windows
+        seg = load_segmented(out / "embryos" / vol.embryo_id, vol)
+        result = build_nucleus_table(seg)                          # minutes, not hours
+
+    The nuclear channel in ``volume`` should still carry the contrast the masks were
+    produced with; a mismatch there is flagged, since it means the masks no longer
+    correspond to the channel-0 image they came from.
+
+    Raises:
+        FileNotFoundError: if no ``*_nuclear_masks.npy`` is present.
+    """
+    embryo_dir = Path(embryo_dir)
+    masks_path = embryo_dir / f"{volume.embryo_id}_nuclear_masks.npy"
+    if not masks_path.exists():
+        candidates = sorted(embryo_dir.glob("*_nuclear_masks.npy"))
+        if not candidates:
+            raise FileNotFoundError(f"no saved nuclear masks in {embryo_dir}")
+        masks_path = candidates[0]
+
+    masks = np.load(masks_path)
+    sidecar = embryo_dir / f"{volume.embryo_id}_gene_map.json"
+    mode, anisotropy = "2d", volume.binned_voxel.anisotropy
+    if sidecar.exists():
+        with open(sidecar, encoding="utf-8") as handle:
+            meta = json.load(handle)
+        mode = meta.get("mode", mode)
+        anisotropy = meta.get("anisotropy", anisotropy)
+        saved_bin = meta.get("bin_size")
+        if saved_bin is not None and saved_bin != volume.bin_size:
+            print(
+                f"  [WARN] {volume.embryo_id}: masks were made at bin_size="
+                f"{saved_bin} but this volume is bin_size={volume.bin_size}. "
+                f"They describe different z sampling and must not be combined."
+            )
+
+    nuclei_shape = volume.binned_channels[min(volume.binned_channels)].shape
+    if tuple(masks.shape) != tuple(nuclei_shape):
+        raise ValueError(
+            f"{volume.embryo_id}: saved masks are {masks.shape} but the volume is "
+            f"{nuclei_shape}. Re-loading with a different bin_size or a rotation that "
+            f"resized the canvas will do this; the masks cannot be reused."
+        )
+
+    if verbose:
+        n_labels = len(np.unique(masks[masks > 0]))
+        print(f"  [LOAD] {volume.embryo_id}: {n_labels} labels from {masks_path.name} "
+              f"(mode={mode})")
+
+    return SegmentedEmbryo(
+        volume=volume,
+        nuclear_masks=masks,
+        mode=mode,
+        output_dir=embryo_dir,
+        masks_path=masks_path,
+        params={"anisotropy": anisotropy, "reloaded": True},
     )
 
 
