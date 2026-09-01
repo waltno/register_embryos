@@ -1,4 +1,5 @@
 # register_embryos
+<img width="346" height="310" alt="Screenshot 2026-08-31 at 5 21 30 PM" src="https://github.com/user-attachments/assets/bcbe82b6-3e02-4271-b205-d31473764ac2" />
 
 Turn a folder of multiplexed HCR `.nd2` z-stacks into per-nucleus gene-intensity
 tables, register the embryos into a common space, and build a composite "atlas"
