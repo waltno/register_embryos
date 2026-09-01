@@ -192,6 +192,17 @@ spread for wt1a 69 → 43 px and tbx1 118 → 65 px.
 So an embryo set wrong in the widget **stays** wrong and no residual will tell you —
 check `orientation_grid(volumes, orientations)` before segmenting.
 
+The cap binds *during* the fit. Clamping a free fit afterwards returns the cap value:
+a 173° fit clamped to 30° left an embryo worse aligned than the flip it came from
+(mean NN 8.09 → 10.88), where projecting each iteration into the allowed set reached
+−7.4° at 8.02. open3d's ICP cannot be constrained mid-fit, so a constrained request
+runs on the numpy backend; the `[ICP]` line names the one actually used.
+
+`trust_orientation` defaults on when orientations are known, so **check the header
+line** — an unconstrained run says so with a `[WARN]`, and the residual will not
+distinguish it (flipped fits scored 6.49–8.81 mean NN against 6.61–8.80 for correct
+ones).
+
 **Point-to-point, not point-to-plane.** The predecessor pipeline defaulted to
 point-to-plane with normals estimated at radius 50–60. A nucleus-centroid cloud is
 not a surface: it is a slab (812 × 734 × 24 here), so **100% of estimated normals

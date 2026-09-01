@@ -433,6 +433,17 @@ class CohortWorkflow:
         # EmbryoResult rebuilt from a CSV would claim provenance it does not have.
         self.results = []
 
+        # Orientations matter here even though no image is loaded: register() decides
+        # whether to trust a manual orientation by whether any is known, and without
+        # this the resume path silently reverts to an unconstrained fit -- which flips
+        # embryos end-for-end on a cloud that cannot distinguish the two.
+        orientation_json = cohort_dir / "orientation.json"
+        if orientation_json.exists() and not len(self.orientations):
+            self.orientations = OrientationSet.load(orientation_json)
+            if verbose:
+                print(f"  {len(self.orientations)} orientation(s) from "
+                      f"{orientation_json}")
+
         self._params["tables_from"] = str(path)
         manifest = cohort_dir / "run_manifest.json"
         if manifest.exists():
@@ -597,6 +608,16 @@ class CohortWorkflow:
         if trust_orientation:
             print(f"  trusting the manual orientation: no PCA re-derivation, "
                   f"in-plane only, capped at +/-{max_rotation_deg:g} deg")
+        else:
+            print(
+                "  [WARN] UNCONSTRAINED fit: PCA re-derives the axes and the rotation\n"
+                "         is uncapped. On a dorsal cohort the nucleus cloud is nearly\n"
+                "         symmetric in plane, so this routinely flips embryos\n"
+                "         anterior-posterior. No orientation is on record for this\n"
+                "         cohort -- if the embryos were rotated by hand, point\n"
+                "         load_tables() at the run holding orientation.json, or pass\n"
+                "         trust_orientation=True explicitly."
+            )
         self.registration = register_cohort(
             self.results or self.combined,
             reference_embryo_id=reference_embryo_id,

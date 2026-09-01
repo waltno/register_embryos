@@ -11,6 +11,7 @@ import matplotlib
 import numpy as np
 import pandas as pd
 import pytest
+from scipy.spatial import cKDTree
 
 matplotlib.use("Agg")
 
@@ -477,3 +478,107 @@ def test_gene_panels_leave_out_unmeasured_nuclei(cohort, tmp_path):
         a.get_title() for a in dropped.axes if "pax2a" in a.get_title())
     matplotlib.pyplot.close(dropped)
     matplotlib.pyplot.close(kept)
+
+
+# -- the rotation cap has to bind during the fit ------------------------------
+
+def _rotated(points, degrees):
+    angle = np.radians(degrees)
+    rotation = np.array([[np.cos(angle), -np.sin(angle), 0.0],
+                         [np.sin(angle), np.cos(angle), 0.0],
+                         [0.0, 0.0, 1.0]])
+    return points @ rotation.T
+
+
+@pytest.fixture
+def slab():
+    """A cloud shaped like a dorsal embryo: wide, thin in z, mildly elongated.
+
+    Mildly elongated on purpose. An isotropic blob fits equally well at *any*
+    rotation, so it cannot tell a good fit from a bad one and any residual
+    comparison on it is noise -- which is close to the real problem (in-plane aspect
+    1.18) but useless as a test.
+    """
+    rng = np.random.default_rng(3)
+    xy = rng.normal(0, 1, (900, 2)) * np.array([110.0, 70.0])
+    z = rng.normal(0, 2, (900, 1))
+    return np.hstack([xy, z])
+
+
+def test_constrained_fit_stays_inside_the_cap_when_the_free_fit_wants_a_flip(slab):
+    from register_embryos.registration import icp_point_to_point, rotation_angles
+
+    target = _rotated(slab, 170.0)
+    _, transform = icp_point_to_point(
+        slab, target, pca_init=True, inplane_only=True, max_rotation_deg=30.0)
+    # The free fit would take the 170 degrees; the cap must hold anyway.
+    in_plane, tilt = rotation_angles(transform)
+    assert abs(in_plane) <= 30.0 + 1e-6
+    assert tilt == pytest.approx(0.0, abs=1e-6)
+
+
+def test_the_cap_does_not_become_the_answer(slab):
+    """Clamping a flipped fit returns the cap; projecting each iteration does not.
+
+    The truth here is a small rotation. An unconstrained fit on a near-symmetric
+    cloud can instead land ~180 degrees away, and clamping *that* to a 30 degree cap
+    yields exactly 30 -- a rotation nobody asked for, reached by truncating a wrong
+    answer. Measured on the real cohort, that left an embryo worse aligned than the
+    flip it came from (mean NN 8.09 -> 10.88) where the projected fit reached
+    -7.4 degrees at 8.02.
+    """
+    from register_embryos.registration import (
+        _apply_transform, _constrain_rotation, icp_point_to_point, rotation_angles,
+    )
+
+    target = _rotated(slab, 8.0)
+    # What an unconstrained fit produces on this data: the small true rotation, ~180
+    # degrees out. Constructed rather than fitted so the test pins the clamping
+    # behaviour and not PCA's choice on one particular fixture.
+    flipped = np.eye(4)
+    flipped[:3, :3] = _rotated(np.eye(3), 8.0 - 180.0)
+
+    clamped = _constrain_rotation(flipped, slab.mean(axis=0), 30.0, True)
+    projected_points, projected = icp_point_to_point(
+        slab, target, pca_init=False, inplane_only=True, max_rotation_deg=30.0)
+
+    # Clamping saturates: the answer is the boundary, whatever the data said.
+    assert abs(abs(rotation_angles(clamped)[0]) - 30.0) < 1e-6
+    # Projecting finds the real 8 degrees instead.
+    assert rotation_angles(projected)[0] == pytest.approx(8.0, abs=2.0)
+
+    tree = cKDTree(target)
+    clamped_nn = tree.query(_apply_transform(slab, clamped))[0].mean()
+    projected_nn = tree.query(projected_points)[0].mean()
+    assert projected_nn < clamped_nn
+
+
+def test_a_constrained_fit_still_recovers_a_real_small_rotation(slab):
+    """The cap must not flatten a genuine correction to zero."""
+    from register_embryos.registration import icp_point_to_point, rotation_angles
+
+    target = _rotated(slab, 12.0)
+    _, transform = icp_point_to_point(
+        slab, target, pca_init=False, inplane_only=True, max_rotation_deg=30.0)
+    assert rotation_angles(transform)[0] == pytest.approx(12.0, abs=2.0)
+
+
+def test_load_tables_recovers_the_orientations_that_gate_the_cap(tmp_path):
+    """The resume path lost them, and register() then silently ran unconstrained."""
+    from register_embryos.naming import CohortKey
+    from register_embryos.orientation import OrientationSet
+    from register_embryos.workflow import CohortWorkflow
+
+    cohort_dir = tmp_path / "20260831" / "wt_12s_dorsal_20X"
+    cohort_dir.mkdir(parents=True)
+    pd.DataFrame({"embryo_id": ["a", "b"], "x": [0.0, 1.0], "y": [0.0, 1.0],
+                  "z": [0.0, 0.0], "hand2": [0.5, 0.5]}).to_csv(
+        cohort_dir / "combined_nucleus_table.csv", index=False)
+    OrientationSet.from_angles(["a", "b"], [153.0, 29.0]).save(
+        cohort_dir / "orientation.json")
+
+    wf = CohortWorkflow(cohort=CohortKey("wt", "12s", "dorsal", "20X"), embryos=[],
+                        output_root=tmp_path / "out")
+    assert len(wf.orientations) == 0
+    wf.load_tables(cohort_dir, verbose=False)
+    assert len(wf.orientations) == 2

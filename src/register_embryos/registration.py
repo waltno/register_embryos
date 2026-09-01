@@ -251,12 +251,28 @@ def _icp_numpy(
     max_correspondence_distance: float,
     max_iteration: int,
     tolerance: float,
+    max_rotation_deg: Optional[float] = None,
+    inplane_only: bool = False,
 ) -> np.ndarray:
-    """Point-to-point ICP by repeated Kabsch fits on nearest-neighbour pairs."""
+    """Point-to-point ICP by repeated Kabsch fits on nearest-neighbour pairs.
+
+    With ``max_rotation_deg`` or ``inplane_only`` set, the *cumulative* transform is
+    projected back into the allowed set at the end of every iteration, so the search
+    stays feasible and the correspondences for the next iteration are drawn from a
+    feasible pose.
+
+    That is not the same as fitting freely and clamping at the end. A free fit that
+    wants 173 degrees, clamped to a 30 degree cap, returns exactly 30 -- a spurious
+    rotation nobody asked for, arrived at by truncating a wrong answer. Projecting
+    each iteration instead converges on the best fit *within* the cap, which for a
+    manually oriented cohort is usually near zero.
+    """
     target_tree = cKDTree(target)
     transform = np.eye(4)
     current = source.copy()
     previous_error = np.inf
+    constrained = max_rotation_deg is not None or inplane_only
+    centroid = source.mean(axis=0)
 
     for _ in range(max_iteration):
         distances, indices = target_tree.query(current)
@@ -280,6 +296,10 @@ def _icp_numpy(
         step[:3, :3] = rotation
         step[:3, 3] = translation
         transform = step @ transform
+        if constrained:
+            transform = _constrain_rotation(
+                transform, centroid, max_rotation_deg, inplane_only
+            )
         current = _apply_transform(source, transform)
 
         error = float(distances[keep].mean())
@@ -356,9 +376,16 @@ def icp_point_to_point(
         raise ValueError("both clouds need at least 3 points")
 
     init = pca_align(source, target) if pca_init else np.eye(4)
-    use_open3d = backend == "open3d" or (backend == "auto" and HAS_OPEN3D)
+    constrained = max_rotation_deg is not None or inplane_only
     if backend == "open3d" and not HAS_OPEN3D:
         raise ImportError("backend='open3d' requested but open3d is not installed")
+    # open3d's ICP cannot be constrained mid-fit, so a constrained request goes to
+    # the numpy backend even when open3d is available. Fitting freely in open3d and
+    # clamping afterwards returns the cap value, not the best fit under the cap.
+    use_open3d = (
+        backend == "open3d"
+        or (backend == "auto" and HAS_OPEN3D and not constrained)
+    )
 
     if use_open3d:
         try:
@@ -371,13 +398,17 @@ def icp_point_to_point(
             transform = _icp_numpy(
                 _apply_transform(source, init), target,
                 max_correspondence_distance, max_iteration, tolerance,
+                max_rotation_deg=max_rotation_deg, inplane_only=inplane_only,
             ) @ init
     else:
         transform = _icp_numpy(
             _apply_transform(source, init), target,
             max_correspondence_distance, max_iteration, tolerance,
+            max_rotation_deg=max_rotation_deg, inplane_only=inplane_only,
         ) @ init
 
+    # Final projection: catches the open3d path, and any rotation the `init` itself
+    # contributed -- a PCA init can hand over a 180 degree flip before ICP starts.
     transform = _constrain_rotation(
         transform, source.mean(axis=0), max_rotation_deg, inplane_only
     )
@@ -713,10 +744,17 @@ def register_frames(
         )
 
     reference_cloud = tables[reference_embryo_id][list(coord_cols)].to_numpy(dtype=float)
-    backend = "open3d" if HAS_OPEN3D else "numpy"
+    # Report the backend actually used: a constrained fit goes to numpy even when
+    # open3d is installed, because open3d cannot honour the cap mid-fit.
+    constrained = (
+        icp_kwargs.get("max_rotation_deg") is not None
+        or icp_kwargs.get("inplane_only", False)
+    )
+    backend = "open3d" if (HAS_OPEN3D and not constrained) else "numpy"
     if verbose:
+        detail = " (constrained: capped in-plane rotation)" if constrained else ""
         print(
-            f"  [ICP] point-to-point ({backend}) -> reference "
+            f"  [ICP] point-to-point ({backend}){detail} -> reference "
             f"{reference_embryo_id} ({len(reference_cloud):,} points)"
         )
 
