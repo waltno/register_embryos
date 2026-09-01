@@ -902,11 +902,24 @@ def plot_gene_panels_2d(
     projection: Tuple[int, int] = (0, 1),
     suptitle: str = "",
     threshold: float = INTENSITY_THRESH,
+    drop_unmeasured: bool = True,
     save_path: Optional[str | Path] = None,
     panel_size: float = 4.0,
     z_aspect: Optional[float] = None,
 ):
-    """One panel per gene in a single projection, silent nuclei as grey context."""
+    """One panel per gene in a single projection, silent nuclei as grey context.
+
+    Works on a single embryo, a pooled registered cohort, or an atlas.
+
+    Args:
+        drop_unmeasured: leave out nuclei whose value for that gene is NaN, rather
+            than drawing them grey. NaN means "not measured here" -- an embryo whose
+            panel never carried this gene, or an atlas point with no measuring
+            neighbour -- and drawing it as a silent nucleus asserts a negative that
+            was never observed. On a pooled cohort with a rotating panel that is most
+            of the frame, so it is the difference between a readable panel and a
+            misleading one. Each panel's title reports what it is actually showing.
+    """
     import matplotlib
     import matplotlib.pyplot as plt
     from matplotlib.colors import LinearSegmentedColormap
@@ -927,9 +940,10 @@ def plot_gene_panels_2d(
         cmap = LinearSegmentedColormap.from_list(
             f"{gene}_ramp", [_hex(theme.silent_rgb), _hex(gene_color(gene, column))]
         )
-        positive = (df[gene].fillna(0) >= threshold).to_numpy()
-        x_all, y_all = df[cx].to_numpy(), df[cy].to_numpy()
-        values = df[gene].fillna(0).to_numpy()
+        panel = df[df[gene].notna()] if drop_unmeasured else df
+        positive = (panel[gene].fillna(0) >= threshold).to_numpy()
+        x_all, y_all = panel[cx].to_numpy(), panel[cy].to_numpy()
+        values = panel[gene].fillna(0).to_numpy()
         ax.scatter(
             x_all[~positive], y_all[~positive],
             c=[theme.silent_rgb], s=2, alpha=0.35, rasterized=True,
@@ -943,8 +957,12 @@ def plot_gene_panels_2d(
             )
             bar = fig.colorbar(scatter, ax=ax, shrink=0.75)
             bar.ax.tick_params(colors=theme.axis_label, labelsize=6)
-        _style_axes(ax, theme, cx, cy, f"{gene} — {int(positive.sum()):,} positive",
-                    z_aspect=z_aspect)
+        title = f"{gene} — {int(positive.sum()):,} / {len(panel):,} positive"
+        if drop_unmeasured and "embryo_id" in panel.columns:
+            n_embryos = panel["embryo_id"].nunique()
+            if n_embryos != df["embryo_id"].nunique():
+                title += f"  ({n_embryos} of {df['embryo_id'].nunique()} embryos)"
+        _style_axes(ax, theme, cx, cy, title, z_aspect=z_aspect)
 
     if suptitle:
         fig.suptitle(suptitle, color=theme.font, fontsize=12)

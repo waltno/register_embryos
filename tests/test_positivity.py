@@ -453,3 +453,27 @@ def test_load_registration_takes_the_reference_from_the_residuals(tmp_path):
     assert result.reference_embryo_id == "b"
     assert sorted(result.embryo_ids) == ["a", "b"]
     assert not wf.combined.empty        # standing in for the un-run build_tables
+
+
+# -- per-gene panels on a rotating panel --------------------------------------
+
+def test_gene_panels_leave_out_unmeasured_nuclei(cohort, tmp_path):
+    """NaN is "not measured here", and drawing it grey asserts an unobserved negative."""
+    from register_embryos.plotting import plot_gene_panels_2d
+
+    dropped = plot_gene_panels_2d(cohort, threshold=0.05,
+                                  save_path=tmp_path / "dropped.png")
+    kept = plot_gene_panels_2d(cohort, threshold=0.05, drop_unmeasured=False,
+                               save_path=tmp_path / "kept.png")
+
+    def drawn(fig, gene):
+        ax = next(a for a in fig.axes if gene in a.get_title())
+        return sum(int(c.get_offsets().shape[0]) for c in ax.collections)
+
+    # pax2a is in e1 only, so its panel should show half the cohort, not all of it.
+    assert drawn(dropped, "pax2a") == (cohort["pax2a"].notna()).sum()
+    assert drawn(kept, "pax2a") == len(cohort)
+    assert "1 of 2 embryos" in next(
+        a.get_title() for a in dropped.axes if "pax2a" in a.get_title())
+    matplotlib.pyplot.close(dropped)
+    matplotlib.pyplot.close(kept)
