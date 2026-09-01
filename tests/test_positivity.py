@@ -403,3 +403,53 @@ def test_2d_assignment_cap_is_in_micrometres_not_pixels():
                                    verbose=False)[0, 0, 10] == 1
     assert assign_signal_pixels_2d(masks, signal, xy_um=2.0, max_distance=6.0,
                                    verbose=False)[0, 0, 10] == 0
+
+
+# -- resuming from finished tables --------------------------------------------
+
+def test_cohort_dir_resolves_from_the_run_root_or_the_file(tmp_path):
+    from register_embryos.workflow import find_cohort_dir
+
+    cohort_dir = tmp_path / "20260831" / "wt_12s_dorsal_20X"
+    cohort_dir.mkdir(parents=True)
+    table = cohort_dir / "combined_nucleus_table.csv"
+    table.write_text("embryo_id\n")
+
+    for given in (tmp_path / "20260831", cohort_dir, table):
+        assert find_cohort_dir(given, cohort_name="wt_12s_dorsal_20X") == cohort_dir
+
+
+def test_missing_table_names_the_paths_tried(tmp_path):
+    from register_embryos.workflow import find_cohort_dir
+
+    with pytest.raises(FileNotFoundError, match="combined_nucleus_table.csv"):
+        find_cohort_dir(tmp_path, cohort_name="wt_12s_dorsal_20X")
+
+
+def test_load_registration_takes_the_reference_from_the_residuals(tmp_path):
+    """Which embryo everything was aligned to is not recoverable from coordinates."""
+    from register_embryos.naming import CohortKey
+    from register_embryos.workflow import CohortWorkflow
+
+    cohort_dir = tmp_path / "run" / "wt_12s_dorsal_20X"
+    cohort_dir.mkdir(parents=True)
+    registered = pd.DataFrame({
+        "embryo_id": ["a"] * 3 + ["b"] * 3,
+        "x": range(6), "y": range(6), "z": [0] * 6,
+        "x_reg": range(6), "y_reg": range(6), "z_reg": [0] * 6,
+        "hand2": [0.5] * 6,
+    })
+    registered.to_csv(cohort_dir / "registered_nucleus_table.csv", index=False)
+    # "b" is the reference even though "a" comes first in the table.
+    pd.DataFrame([{"embryo_id": "a", "reference_embryo_id": "b", "mean_before": 9.0,
+                   "mean_after": 3.0}]).to_csv(
+        cohort_dir / "registration_residuals.csv", index=False)
+
+    wf = CohortWorkflow(
+        cohort=CohortKey("wt", "12s", "dorsal", "20X"), embryos=[],
+        output_root=tmp_path / "out",
+    )
+    result = wf.load_registration(cohort_dir, verbose=False)
+    assert result.reference_embryo_id == "b"
+    assert sorted(result.embryo_ids) == ["a", "b"]
+    assert not wf.combined.empty        # standing in for the un-run build_tables

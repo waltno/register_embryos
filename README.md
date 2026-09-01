@@ -167,6 +167,20 @@ register-embryos run <nd2_dir> -o <out> --masks-from <previous run>
 The run root, the cohort dir and its `embryos/` dir all resolve. A mask whose shape
 or bin size no longer matches is refused rather than combined.
 
+**Resume without images at all.** Registration, the atlas and every figure need only
+the nucleus table, so on a fresh kernel skip straight past loading and segmentation:
+
+```python
+wf = CohortWorkflow.from_directory(nd2_dir, output_root=out, cohort=name)  # names only
+wf.load_tables("…/data/hcr/20260831")        # no load(), no segment()
+wf.load_registration("…/data/hcr/20260831")  # optional: skip ICP too
+wf.build_atlas(); wf.plot_all()
+```
+
+`load_registration` takes the reference embryo from `registration_residuals.csv`
+rather than guessing — which embryo everything was aligned to is not recoverable from
+the coordinates.
+
 **Registration trusts your manual orientation.** A 12-somite dorsal cloud is nearly a
 disc of revolution (in-plane aspect **1.18**), so nothing in the positions pins down
 the AP angle — nearest-neighbour residual scored a 180°-flipped fit as well as a

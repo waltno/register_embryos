@@ -155,6 +155,7 @@ from .widgets import PrepConfig, orientation_widget, prepare_widget
 from .workflow import (
     CohortOutputs,
     CohortWorkflow,
+    find_cohort_dir,
     find_masks_dir,
     run_all_cohorts,
     run_cohort,
@@ -197,7 +198,7 @@ __all__ = [
     "otsu_threshold", "threshold_sweep", "plot_threshold_diagnostics",
     "DEFAULT_THRESHOLD", "gene_columns", "as_frames", "resolve_gene_cuts",
     "positive_calls", "positive_fraction",
-    "find_masks_dir",
+    "find_masks_dir", "find_cohort_dir",
     # plotting
     "Theme", "DARK", "LIGHT", "theme_for", "GENE_RGB", "additive_style",
     "plot_pointcloud_3d", "plot_additive_3d", "plot_additive_2d",

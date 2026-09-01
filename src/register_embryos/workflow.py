@@ -44,7 +44,7 @@ from .segmentation import SegmentedEmbryo, load_segmented, segment_cohort
 
 __all__ = [
     "CohortWorkflow", "CohortOutputs", "run_cohort", "run_all_cohorts", "scan",
-    "DEFAULT_BIN_SIZE", "default_bin_size",
+    "DEFAULT_BIN_SIZE", "default_bin_size", "find_masks_dir", "find_cohort_dir",
 ]
 
 
@@ -394,6 +394,122 @@ class CohortWorkflow:
             self._params["masks_reloaded"] = True
             self._params["masks_from"] = str(embryos_dir)
         return segmented
+
+    # -- resuming from finished tables -------------------------------------
+
+    def load_tables(
+        self,
+        tables_from: Optional[str | Path] = None,
+        verbose: bool = True,
+    ) -> pd.DataFrame:
+        """Read a finished nucleus table instead of re-deriving it from images.
+
+        Everything downstream of the table -- registration, the atlas, every figure --
+        needs only the table, so this skips loading ND2s and running Cellpose
+        entirely and takes seconds:
+
+            wf = CohortWorkflow.from_directory(nd2_dir, output_root=out, cohort=name)
+            wf.load_tables("…/data/hcr/20260831")     # no load(), no segment()
+            wf.register(); wf.build_atlas(); wf.plot_all()
+
+        ``from_directory`` only parses filenames, so the cohort and its embryo
+        metadata are already known without touching an image.
+
+        Args:
+            tables_from: the run holding ``combined_nucleus_table.csv`` -- the dated
+                run root, the cohort directory, or the CSV itself. Defaults to this
+                run's own output directory.
+
+        Raises:
+            FileNotFoundError: if no combined table is found under that path.
+        """
+        cohort_dir = find_cohort_dir(
+            tables_from if tables_from is not None else self.output_dir,
+            cohort_name=self.cohort.name,
+        )
+        path = cohort_dir / "combined_nucleus_table.csv"
+        self.combined = pd.read_csv(path)
+        # results stays empty: register() falls back to the combined table, and an
+        # EmbryoResult rebuilt from a CSV would claim provenance it does not have.
+        self.results = []
+
+        self._params["tables_from"] = str(path)
+        manifest = cohort_dir / "run_manifest.json"
+        if manifest.exists():
+            with open(manifest, encoding="utf-8") as handle:
+                self._params["source_parameters"] = json.load(handle).get("parameters", {})
+
+        if verbose:
+            print(f"\n{'='*72}\nLOAD TABLES — {self.cohort.name}\n{'='*72}")
+            print(f"  {len(self.combined):,} nucleus rows from {path}")
+            in_table = set(self.combined["embryo_id"].unique())
+            expected = {embryo.embryo_id for embryo in self.embryos}
+            for label, missing in (("not in the table", expected - in_table),
+                                   ("not in the cohort", in_table - expected)):
+                if missing:
+                    print(f"  [WARN] {len(missing)} embryo(s) {label}: "
+                          f"{sorted(missing)}")
+            for embryo_id, group in self.combined.groupby("embryo_id", sort=False):
+                print(f"    {embryo_id}: {len(group):,} nuclei")
+        return self.combined
+
+    def load_registration(
+        self,
+        tables_from: Optional[str | Path] = None,
+        verbose: bool = True,
+    ) -> RegistrationResult:
+        """Restore a finished registration, so the atlas and figures can be redone.
+
+        Reads ``registered_nucleus_table.csv`` plus the residuals and transforms
+        beside it. The reference embryo comes from the residuals table rather than
+        being guessed, since which embryo everything was aligned to is not
+        recoverable from the coordinates.
+
+        Use it to re-atlas or re-plot an existing registration; call
+        :meth:`register` instead to redo the fit itself.
+        """
+        cohort_dir = find_cohort_dir(
+            tables_from if tables_from is not None else self.output_dir,
+            cohort_name=self.cohort.name,
+            filename="registered_nucleus_table.csv",
+        )
+        registered = pd.read_csv(cohort_dir / "registered_nucleus_table.csv")
+
+        stats_path = cohort_dir / "registration_residuals.csv"
+        stats = pd.read_csv(stats_path) if stats_path.exists() else pd.DataFrame()
+        if "reference_embryo_id" in stats.columns and not stats.empty:
+            reference_embryo_id = str(stats["reference_embryo_id"].iloc[0])
+        else:
+            reference_embryo_id = str(registered["embryo_id"].iloc[0])
+            if verbose:
+                print(f"  [WARN] no residuals table; assuming the reference was "
+                      f"{reference_embryo_id}")
+
+        transforms_path = cohort_dir / "registration_transforms.npz"
+        transforms = (
+            {key: value for key, value in np.load(transforms_path).items()}
+            if transforms_path.exists() else {}
+        )
+
+        self.registration = RegistrationResult(
+            registered=registered, stats=stats,
+            reference_embryo_id=reference_embryo_id, transforms=transforms,
+        )
+        if self.combined.empty:
+            self.combined = registered
+        self._params["registration_from"] = str(cohort_dir)
+
+        if verbose:
+            print(f"\n{'='*72}\nLOAD REGISTRATION — {self.cohort.name}\n{'='*72}")
+            print(f"  {len(registered):,} rows, {len(self.registration.embryo_ids)} "
+                  f"embryos, reference {reference_embryo_id}")
+            if not stats.empty and "mean_after" in stats.columns:
+                moved = stats[stats["embryo_id"] != reference_embryo_id]
+                if not moved.empty:
+                    print(f"  mean NN residual: {moved['mean_before'].mean():.2f} "
+                          f"-> {moved['mean_after'].mean():.2f} px "
+                          f"(cohort mean, reference excluded)")
+        return self.registration
 
     def build_tables(
         self,
@@ -746,6 +862,31 @@ def find_masks_dir(
     raise FileNotFoundError(
         f"no saved nuclear masks under {path}. Tried: "
         + ", ".join(str(c) for c in candidates)
+    )
+
+
+def find_cohort_dir(
+    path: str | Path,
+    cohort_name: Optional[str] = None,
+    filename: str = "combined_nucleus_table.csv",
+) -> Path:
+    """Resolve a path to the cohort directory holding ``filename``.
+
+    Same tolerance as :func:`find_masks_dir`: the dated run root, the cohort
+    directory, or the file itself all work, because which one you have to hand
+    depends on which you happen to be looking at.
+    """
+    path = Path(path)
+    if path.is_file():
+        return path.parent
+    candidates = [path / cohort_name] if cohort_name else []
+    candidates.append(path)
+    for candidate in candidates:
+        if (candidate / filename).is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"no {filename} under {path}. Tried: "
+        + ", ".join(str(c / filename) for c in candidates)
     )
 
 
