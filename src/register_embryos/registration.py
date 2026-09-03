@@ -31,7 +31,9 @@ __all__ = [
     "HAS_OPEN3D",
     "rotation_angles",
     "sinkhorn_plan",
+    "unbalanced_sinkhorn_potentials",
     "ot_refine",
+    "robot_refine",
     "RegistrationResult",
     "isotropic_downsample",
     "pca_align",
@@ -622,6 +624,269 @@ def ot_refine(
 
 
 # ---------------------------------------------------------------------------
+# RobOT: robust (unbalanced) optimal transport, iterated
+# ---------------------------------------------------------------------------
+
+def unbalanced_sinkhorn_potentials(
+    cost: np.ndarray,
+    epsilon: float,
+    weights_source: Optional[np.ndarray] = None,
+    weights_target: Optional[np.ndarray] = None,
+    reach: Optional[float] = None,
+    n_iter: int = 100,
+    tol: float = 1e-9,
+    init: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Log-domain Sinkhorn potentials, optionally **unbalanced**.
+
+    The difference from :func:`sinkhorn_plan` is ``reach``, and it is the
+    difference that matters on this data. Balanced OT must move *all* the source
+    mass onto the target: two embryos with 2.5k and 4.5k nuclei, imaged over
+    slightly different extents, are forced into an exact correspondence that does
+    not exist, and the surplus is smeared over whatever is nearest. Unbalanced OT
+    prices marginal violation at ``reach`` instead of forbidding it, so mass with
+    no counterpart is dropped rather than matched to something wrong. That is the
+    "robust" in RobOT.
+
+    Args:
+        cost: ``(n, m)``, in this module always ``0.5 * squared distance`` so that
+            ``epsilon = blur**2`` and ``rho = reach**2`` carry the same units as
+            geomloss, which the reference implementation uses.
+        reach: the distance beyond which it is cheaper to destroy mass than to
+            transport it. ``None`` is balanced OT, i.e. the classical constraint.
+        init: warm-start potentials, which is what makes epsilon annealing cheap.
+
+    Returns the potentials ``(f, g)``; the plan is
+    ``a_i b_j exp((f_i + g_j - cost_ij) / epsilon)``.
+    """
+    from scipy.special import logsumexp
+
+    n, m = cost.shape
+    a = np.full(n, 1.0 / n) if weights_source is None else weights_source / weights_source.sum()
+    b = np.full(m, 1.0 / m) if weights_target is None else weights_target / weights_target.sum()
+    log_a, log_b = np.log(a + 1e-300), np.log(b + 1e-300)
+
+    f, g = (np.zeros(n), np.zeros(m)) if init is None else (init[0].copy(), init[1].copy())
+    # Unbalanced updates are the balanced ones damped by rho/(rho+epsilon): at
+    # rho -> infinity this is 1 and the constraint is exact again.
+    damping = 1.0 if reach is None else float(reach) ** 2 / (float(reach) ** 2 + epsilon)
+
+    for _ in range(n_iter):
+        f_prev = f
+        f = -damping * epsilon * logsumexp(
+            (g[None, :] - cost) / epsilon + log_b[None, :], axis=1
+        )
+        g = -damping * epsilon * logsumexp(
+            (f[:, None] - cost) / epsilon + log_a[:, None], axis=0
+        )
+        if np.max(np.abs(f - f_prev)) < tol * max(epsilon, 1e-12):
+            break
+    return f, g
+
+
+def _weighted_similarity(
+    source: np.ndarray,
+    target: np.ndarray,
+    weights: np.ndarray,
+    with_scale: bool = True,
+    max_scale: float = 1.15,
+) -> np.ndarray:
+    """Weighted Procrustes: the rigid (or similarity) map taking source onto target.
+
+    ``with_scale`` mirrors the reference's ``eval_scale_for_rigid``, which is on by
+    default there -- its "rigid" solve estimates a uniform scale too. Embryos differ
+    in size and stage, so withholding the scale makes the fit absorb that difference
+    as a translation instead.
+    """
+    total = weights.sum()
+    mu_source = (source * weights[:, None]).sum(0) / total
+    mu_target = (target * weights[:, None]).sum(0) / total
+    centred_source = source - mu_source
+    centred_target = target - mu_target
+
+    covariance = (centred_source * weights[:, None]).T @ centred_target
+    u, _, vt = np.linalg.svd(covariance)
+    rotation = vt.T @ u.T
+    if np.linalg.det(rotation) < 0:                     # reflection guard
+        vt[-1, :] *= -1
+        rotation = vt.T @ u.T
+
+    scale = 1.0
+    if with_scale:
+        variance = float((weights[:, None] * centred_source**2).sum())
+        scale = float(np.trace(rotation.T @ covariance) / max(variance, 1e-12))
+        scale = float(np.clip(scale, 1.0 / max_scale, max_scale))
+
+    linear = scale * rotation
+    transform = np.eye(4)
+    transform[:3, :3] = linear
+    transform[:3, 3] = mu_target - linear @ mu_source
+    return transform
+
+
+def robot_refine(
+    source: np.ndarray,
+    target: np.ndarray,
+    blur: Optional[float] = None,
+    reach: Optional[float] = None,
+    scaling: float = 0.9,
+    n_outer: int = 10,
+    rel_ftol: float = 1e-2,
+    with_scale: bool = True,
+    max_scale: float = 1.15,
+    max_points: int = 1500,
+    n_iter_final: int = 50,
+    max_rotation_deg: Optional[float] = None,
+    inplane_only: bool = False,
+    use_barycenter_weight: bool = True,
+    seed: int = 42,
+    verbose: bool = True,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Rigid/similarity registration by iterated robust optimal transport.
+
+    A minimal port of the RobOT prealignment of Shen et al., *Accurate Point Cloud
+    Registration with Robust Optimal Transport* (NeurIPS 2021,
+    https://github.com/uncbiag/robot), specifically ``GradFlowPreAlign`` with
+    ``gradflow_mode="ot_mapping"``. Written against numpy and scipy rather than
+    torch/geomloss/KeOps, which the reference needs and this package does not have.
+
+    Four things separate it from :func:`ot_refine`, and each one is a reason that
+    function could only ever degrade an already-converged ICP fit here:
+
+    1. **Unbalanced OT** (``reach``). Balanced OT must transport every source point
+       somewhere. With unequal nucleus counts and partial overlap that manufactures
+       correspondences; ``reach`` lets unmatched mass be dropped instead.
+    2. **Epsilon annealing** (``scaling``). One fixed epsilon is either too coarse
+       to localise or too fine to escape a local optimum. Annealing from the cloud
+       diameter down to ``blur`` gets both, and warm-started potentials make the
+       extra sweeps nearly free.
+    3. **Outer iteration** (``n_outer``). The plan is recomputed from the moved
+       source and the transforms composed. A single plan plus a single Procrustes
+       solve -- what :func:`ot_refine` does -- cannot improve on a fit that is
+       already at the fixed point of its own correspondence rule.
+    4. **Scale** (``with_scale``, the reference's ``eval_scale_for_rigid``, on by
+       default there too).
+
+    ``use_barycenter_weight`` weights the Procrustes solve by how much mass each
+    source point actually kept, so a nucleus the transport gave up on stops voting.
+    That is only meaningful when ``reach`` is set; under balanced OT every row keeps
+    its full mass by construction.
+
+    Args:
+        blur: the finest length scale the transport resolves, in the same units as
+            the coordinates. Defaults to 2% of the cloud diameter.
+        reach: robustness radius, same units. Defaults to 20% of the diameter
+            (the reference uses ``reach=2`` on clouds normalised to ~unit
+            diameter). ``None`` gives balanced OT.
+        max_rotation_deg / inplane_only: left unconstrained by default -- unlike
+            :func:`ot_refine`, this is a registration in its own right, not a
+            refinement. Constrain it the same way when it runs after ICP on a
+            hand-oriented cohort.
+
+    Returns ``(transformed_source, transform)``.
+    """
+    rng = np.random.default_rng(seed)
+
+    def subsample(points: np.ndarray) -> np.ndarray:
+        if len(points) <= max_points:
+            return points
+        return points[rng.choice(len(points), max_points, replace=False)]
+
+    src_s, tgt_s = subsample(source), subsample(target)
+    diameter = float(
+        np.linalg.norm(np.ptp(np.vstack([src_s, tgt_s]), axis=0))
+    )
+    if blur is None:
+        blur = 0.02 * diameter
+    if reach is None:
+        reach = 0.20 * diameter
+
+    epsilon_final = max(float(blur) ** 2, 1e-12)
+    # Start at half the diameter, not the whole one: the first few levels of a
+    # diameter-scale epsilon are a uniform plan and cost a sweep each to learn it.
+    epsilon_start = max((0.5 * float(diameter)) ** 2, epsilon_final)
+    weights_source = np.full(len(src_s), 1.0 / len(src_s))
+    weights_target = np.full(len(tgt_s), 1.0 / len(tgt_s))
+
+    transform = np.eye(4)
+    moved = src_s.copy()
+    previous = None
+
+    for outer in range(n_outer):
+        cost = 0.5 * (
+            (moved[:, None, :] - tgt_s[None, :, :]) ** 2
+        ).sum(axis=-1, dtype=np.float64)
+
+        # Epsilon annealing, warm-started: **one** sweep per level, which is what
+        # geomloss's `scaling` does. Running each level to convergence instead is
+        # ~20x the work for the same fixed point -- the whole point of annealing is
+        # that each level starts near its own solution.
+        potentials: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        epsilon = epsilon_start
+        while True:
+            at_final = epsilon <= epsilon_final * (1 + 1e-9)
+            potentials = unbalanced_sinkhorn_potentials(
+                cost, epsilon, weights_source, weights_target, reach=reach,
+                n_iter=n_iter_final if at_final else 1, init=potentials,
+            )
+            if at_final:
+                break
+            epsilon = max(epsilon * scaling**2, epsilon_final)
+
+        f, g = potentials
+        log_plan = (
+            (f[:, None] + g[None, :] - cost) / epsilon
+            + np.log(weights_source)[:, None] + np.log(weights_target)[None, :]
+        )
+        plan = np.exp(log_plan)
+        mass = plan.sum(axis=1)
+        keep = mass > 1e-12
+        if keep.sum() < 3:
+            if verbose:
+                print("    [RobOT] plan degenerate; leaving the transform unchanged")
+            break
+
+        # Barycentric projection: where the transport sends each source point.
+        projected = (plan[keep] @ tgt_s) / mass[keep, None]
+        # Mass kept, relative to what the point started with: ~1 where the
+        # transport found a partner, small where it gave up.
+        ratio = mass[keep] / weights_source[keep]
+        solve_weights = ratio if use_barycenter_weight else np.ones_like(ratio)
+
+        step = _weighted_similarity(
+            moved[keep], projected, solve_weights,
+            with_scale=with_scale, max_scale=max_scale,
+        )
+        if max_rotation_deg is not None or inplane_only:
+            step = _constrain_rotation(
+                step, moved.mean(axis=0), max_rotation_deg, inplane_only
+            )
+        transform = step @ transform
+        moved = _apply_transform(src_s, transform)
+
+        if verbose:
+            residual = float(cKDTree(tgt_s).query(moved)[0].mean())
+            print(f"    [RobOT] iter {outer + 1:2d}  mean NN {residual:7.3f}  "
+                  f"kept mass {ratio.mean():.3f}  eps {epsilon:.2f}")
+        if previous is not None and np.linalg.norm(step - np.eye(4)) < rel_ftol:
+            if verbose:
+                print(f"    [RobOT] converged after {outer + 1} iterations")
+            break
+        previous = transform.copy()
+
+    if verbose:
+        before = float(cKDTree(target).query(source)[0].mean())
+        after = float(cKDTree(target).query(_apply_transform(source, transform))[0].mean())
+        in_plane, tilt = rotation_angles(transform)
+        scales = np.linalg.svd(transform[:3, :3], compute_uv=False)
+        print(f"    [RobOT] blur={blur:.2f} reach={reach if reach is None else f'{reach:.1f}'}"
+              f"  mean NN {before:.3f} -> {after:.3f}  "
+              f"(in-plane {in_plane:+.2f} deg, tilt {tilt:.2f} deg, "
+              f"scale {scales.min():.3f}-{scales.max():.3f})")
+    return _apply_transform(source, transform), transform
+
+
+# ---------------------------------------------------------------------------
 # Cohort-level driver
 # ---------------------------------------------------------------------------
 
@@ -689,8 +954,11 @@ def register_frames(
     center_first: bool = False,
     output_root: Optional[str | Path] = None,
     refine_with_ot: bool = False,
+    refine_with_robot: bool = False,
+    skip_icp: bool = False,
     ot_max_rotation_deg: float = 5.0,
     ot_kwargs: Optional[Dict[str, object]] = None,
+    robot_kwargs: Optional[Dict[str, object]] = None,
     coord_cols: Sequence[str] = COORD_COLS,
     verbose: bool = True,
     **icp_kwargs,
@@ -721,11 +989,21 @@ def register_frames(
         center_first: translate each cloud onto the reference centroid before
             ICP.  Useful for atlas-to-atlas alignment where the two clouds may
             sit in unrelated coordinate ranges.
+        refine_with_robot: run :func:`robot_refine` -- iterated robust OT -- after
+            ICP.  Unconstrained by default, unlike ``refine_with_ot``; pass
+            ``robot_kwargs={"max_rotation_deg": ..., "inplane_only": True}`` to
+            hold it to a hand-set orientation.
+        skip_icp: use the OT stage as the registration rather than as a refinement.
+            Only meaningful with ``refine_with_robot``; ICP is otherwise the only
+            thing producing a transform.
     """
     if not frames:
         return RegistrationResult(pd.DataFrame(), pd.DataFrame(), "", {})
+    if skip_icp and not refine_with_robot:
+        raise ValueError("skip_icp needs refine_with_robot; nothing would register")
 
     ot_kwargs = dict(ot_kwargs or {})
+    robot_kwargs = dict(robot_kwargs or {})
     tables = {
         embryo_id: (
             isotropic_downsample(df, n_target=n_downsample, coord_cols=coord_cols)
@@ -775,21 +1053,39 @@ def register_frames(
             offset = np.zeros(3)
             if center_first:
                 offset = reference_cloud.mean(axis=0) - cloud.mean(axis=0)
-            transformed, transform = icp_point_to_point(
-                cloud + offset, reference_cloud, **icp_kwargs
-            )
-            shift = np.eye(4)
-            shift[:3, 3] = offset
-            transform = transform @ shift
+            if skip_icp:
+                transformed, transform = cloud + offset, np.eye(4)
+                transform[:3, 3] = offset
+            else:
+                transformed, transform = icp_point_to_point(
+                    cloud + offset, reference_cloud, **icp_kwargs
+                )
+                shift = np.eye(4)
+                shift[:3, 3] = offset
+                transform = transform @ shift
 
             if refine_with_ot:
                 if verbose:
                     print(f"    {embryo_id}: OT refinement")
+                # setdefault, not a keyword: passing both here and splatting
+                # ot_kwargs raised "got multiple values for keyword argument"
+                # whenever a caller tried to override either of them, which made
+                # the documented way of unconstraining this stage unusable.
+                ot_kwargs.setdefault("max_rotation_deg", ot_max_rotation_deg)
+                ot_kwargs.setdefault(
+                    "inplane_only", icp_kwargs.get("inplane_only", False)
+                )
                 transformed, extra = ot_refine(
                     transformed, reference_cloud,
-                    max_rotation_deg=ot_max_rotation_deg,
-                    inplane_only=icp_kwargs.get("inplane_only", False),
                     verbose=verbose, **ot_kwargs,
+                )
+                transform = extra @ transform
+
+            if refine_with_robot:
+                if verbose:
+                    print(f"    {embryo_id}: RobOT")
+                transformed, extra = robot_refine(
+                    transformed, reference_cloud, verbose=verbose, **robot_kwargs,
                 )
                 transform = extra @ transform
 

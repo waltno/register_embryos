@@ -34,7 +34,7 @@ from .contrast import (
 from .imaging import EmbryoVolume
 from .orientation import Orientation, OrientationSet, clipping_fraction, rotate_frame
 
-__all__ = ["PrepConfig", "prepare_widget", "orientation_widget"]
+__all__ = ["PrepConfig", "prepare_widget", "orientation_widget", "segmentation_widget"]
 
 
 @dataclass
@@ -519,3 +519,202 @@ def orientation_widget(
     )
     prepare_widget(volumes, config=config, **kwargs)
     return config.orientations
+
+
+def segmentation_widget(
+    segmented,
+    mode: str = "light",
+    style: str = "outline",
+    channel: int = 0,
+    figsize: Tuple[float, float] = (12.0, 5.6),
+    alpha: float = 0.45,
+):
+    """Walk the nuclear masks down z, one plane at a time.
+
+    The interactive twin of
+    :func:`~register_embryos.plotting.plot_mask_planes`: image on the left,
+    masks over it on the right, and a z slider between them.  Takes one
+    :class:`~register_embryos.segmentation.SegmentedEmbryo` or a list of them
+    (``wf.segmented``), which is why it works straight after ``segment()`` or
+    ``reload_segmentation()`` -- no tables, no thresholds.
+
+    Label colours are seeded on the id, so with linked labels (``3d`` or
+    ``2d+link``) a nucleus keeps its colour as you scroll through z and can be
+    followed down the stack.  In plain ``2d`` the ids restart on every plane, so
+    a repeated colour means nothing; the header says which case you are in.
+
+    Controls:
+        z-bin        which plane to draw
+        Channel      what to draw underneath -- 0 is what Cellpose saw
+        Overlay      outline / filled / none
+        tint         interior strength, for ``filled``
+        crop         zoom to the bounding box of all labels
+        side by side toggle the bare image panel
+
+    Args:
+        mode: ``"light"`` or ``"dark"``, matching the plotting themes.
+
+    Raises:
+        ImportError: if ipywidgets is unavailable -- use
+            :func:`~register_embryos.plotting.plot_mask_planes` instead.
+    """
+    widgets, display = _require_widgets()
+    import matplotlib.pyplot as plt
+
+    from .plotting import label_lut, mask_overlay_rgb, theme_for
+
+    embryos = [segmented] if not isinstance(segmented, (list, tuple)) else list(segmented)
+    if not embryos:
+        raise ValueError("no segmented embryos supplied")
+    by_id = {embryo.embryo_id: embryo for embryo in embryos}
+    theme = theme_for(mode)
+
+    # One LUT per embryo, and the per-plane label counts, computed once: both are
+    # a full pass over the volume and neither changes as the slider moves.
+    luts: Dict[str, np.ndarray] = {}
+    counts: Dict[str, np.ndarray] = {}
+    boxes: Dict[str, Tuple[slice, slice]] = {}
+    for embryo in embryos:
+        masks = embryo.nuclear_masks
+        luts[embryo.embryo_id] = label_lut(int(masks.max()))
+        counts[embryo.embryo_id] = np.array(
+            [int(np.unique(plane[plane > 0]).size) for plane in masks]
+        )
+        occupied = np.nonzero((masks > 0).any(axis=0))
+        if occupied[0].size:
+            margin = 12
+            boxes[embryo.embryo_id] = (
+                slice(max(int(occupied[0].min()) - margin, 0),
+                      min(int(occupied[0].max()) + margin + 1, masks.shape[1])),
+                slice(max(int(occupied[1].min()) - margin, 0),
+                      min(int(occupied[1].max()) + margin + 1, masks.shape[2])),
+            )
+        else:
+            boxes[embryo.embryo_id] = (slice(None), slice(None))
+
+    label_width = {"description_width": "70px"}
+    wide = widgets.Layout(width="430px")
+
+    embryo_dd = widgets.Dropdown(
+        options=[embryo.embryo_id for embryo in embryos], description="Embryo:",
+        layout=widgets.Layout(width="620px"), style=label_width,
+    )
+    z_slider = widgets.IntSlider(
+        description="z-bin:", min=0, max=0, value=0, continuous_update=False,
+        layout=wide, style=label_width,
+    )
+    channel_dd = widgets.Dropdown(description="Channel:", style=label_width,
+                                  layout=widgets.Layout(width="300px"))
+    style_tb = widgets.ToggleButtons(
+        options=[("outline", "outline"), ("filled", "filled"), ("none", "none")],
+        value=style, description="Overlay:", style=label_width,
+    )
+    alpha_slider = widgets.FloatSlider(
+        description="tint:", min=0.05, max=1.0, step=0.05, value=alpha,
+        continuous_update=False, readout_format=".2f",
+        layout=widgets.Layout(width="300px"), style=label_width,
+    )
+    crop_cb = widgets.Checkbox(value=False, description="crop to labels", indent=False)
+    compare_cb = widgets.Checkbox(value=True, description="side by side", indent=False)
+
+    header = widgets.HTML()
+    plot_out = widgets.Output()
+    state = {"guard": False}
+
+    def current() -> "object":
+        return by_id[embryo_dd.value]
+
+    def channel_options(embryo) -> List[Tuple[str, int]]:
+        options = []
+        for index in sorted(embryo.adjusted_channels):
+            if index == 0:
+                options.append(("0 — nuclei", 0))
+            else:
+                options.append((f"{index} — {embryo.gene_map.get(index, f'ch{index}')}", index))
+        return options
+
+    def sync_embryo(*_) -> None:
+        embryo = current()
+        state["guard"] = True
+        z_slider.max = embryo.nuclear_masks.shape[0] - 1
+        z_slider.value = int(np.argmax(counts[embryo.embryo_id]))
+        channel_dd.options = channel_options(embryo)
+        channel_dd.value = channel if channel in embryo.adjusted_channels else 0
+        state["guard"] = False
+        refresh_header()
+        redraw()
+
+    def refresh_header() -> None:
+        embryo = current()
+        masks = embryo.nuclear_masks
+        appearances = int(counts[embryo.embryo_id].sum())
+        meaning = (
+            f"<b>{embryo.n_labels:,}</b> nuclei — ids are consistent through z, so "
+            f"one colour is one nucleus, followable down the stack"
+            if embryo.labels_are_3d else
+            f"<b>{appearances:,}</b> label appearances — ids restart on every plane, "
+            f"so the same colour on two planes is <i>not</i> the same nucleus"
+        )
+        blank = int((counts[embryo.embryo_id] == 0).sum())
+        header.value = (
+            f"mode <code>{embryo.mode}</code> &nbsp;|&nbsp; {meaning} &nbsp;|&nbsp; "
+            f"{masks.shape[0]} z-bins, {blank} with no labels"
+        )
+
+    def redraw(*_) -> None:
+        if state["guard"]:
+            return
+        embryo = current()
+        z = z_slider.value
+        rows, cols = boxes[embryo.embryo_id] if crop_cb.value else (slice(None), slice(None))
+        labels = embryo.nuclear_masks[z][rows, cols]
+        image = embryo.adjusted_channels[channel_dd.value][z][rows, cols]
+        on_plane = counts[embryo.embryo_id][z]
+
+        with plot_out:
+            plot_out.clear_output(wait=True)
+            n_panels = 2 if compare_cb.value else 1
+            fig, axes = plt.subplots(
+                1, n_panels,
+                figsize=(figsize[0] if n_panels == 2 else figsize[0] / 1.9, figsize[1]),
+                facecolor=theme.paper, squeeze=False,
+            )
+            axes = axes[0]
+            if compare_cb.value:
+                axes[0].imshow(image, cmap="gray", vmin=0, vmax=1)
+                axes[0].set_title(
+                    f"ch {channel_dd.value} — z-bin {z}", fontsize=9, color=theme.font
+                )
+                axes[0].axis("off")
+            overlay = axes[-1]
+            overlay.imshow(mask_overlay_rgb(
+                labels, image, style=style_tb.value,
+                alpha=alpha_slider.value, lut=luts[embryo.embryo_id],
+            ))
+            overlay.set_title(
+                f"masks — {on_plane:,} label(s) on this plane"
+                + ("  ⚠ none" if on_plane == 0 else ""),
+                fontsize=9, color=theme.font,
+            )
+            overlay.axis("off")
+            fig.tight_layout()
+            plt.show()
+
+    embryo_dd.observe(sync_embryo, names="value")
+    for control in (z_slider, channel_dd, style_tb, alpha_slider, crop_cb, compare_cb):
+        control.observe(redraw, names="value")
+
+    sync_embryo()
+
+    display(
+        widgets.VBox([
+            widgets.HTML("<h4 style='margin:2px 0'>Nuclear masks — z by z</h4>"),
+            header,
+            embryo_dd,
+            widgets.HBox([z_slider, channel_dd]),
+            widgets.HBox([style_tb, alpha_slider]),
+            widgets.HBox([crop_cb, compare_cb]),
+            plot_out,
+        ])
+    )
+    return z_slider

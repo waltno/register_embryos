@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+import pandas as pd
 
 from .imaging import EmbryoVolume, VoxelSize
 
@@ -47,6 +48,7 @@ __all__ = [
     "segment_cohort",
     "load_segmented",
     "relabel_3d_from_2d",
+    "mask_centroids",
 ]
 
 
@@ -103,6 +105,22 @@ class SegmentedEmbryo:
         supposed to benefit from it.
         """
         return self.mode in ("3d", "2d+link")
+
+    def centroids(self, in_um: bool = True) -> pd.DataFrame:
+        """One row per segmented object, straight from the label volume.
+
+        QC convenience over :func:`mask_centroids` that fills in this embryo's
+        voxel size and label semantics.  Coordinates match those the nucleus
+        table would carry, but nothing is measured from the gene channels, so
+        this is available the moment Cellpose finishes -- before any threshold or
+        assignment parameter has been chosen.
+        """
+        return mask_centroids(
+            self.nuclear_masks,
+            voxel=self.volume.binned_voxel if in_um else None,
+            linked=self.labels_are_3d,
+            embryo_id=self.embryo_id,
+        )
 
 
 def available_cpus() -> int:
@@ -501,6 +519,7 @@ def segment_embryo(
                 {
                     "gene_map": {str(k): v for k, v in volume.gene_map.items()},
                     "mode": mode,
+                    "nuclei_channel": nuclei_channel,
                     "anisotropy": resolved_anisotropy,
                     "bin_size": volume.bin_size,
                     "orientation": volume.orientation,
@@ -683,3 +702,105 @@ def segment_cohort(
         for item in segmented:
             print(f"    {item.embryo_id}: {item.n_labels} labels")
     return segmented
+
+
+def mask_centroids(
+    masks: np.ndarray,
+    voxel: Optional[VoxelSize] = None,
+    linked: bool = True,
+    embryo_id: Optional[str] = None,
+) -> pd.DataFrame:
+    """Centroid, voxel count and z-span of every object in a label volume.
+
+    The cheap view of what Cellpose produced.  Unlike
+    :func:`~register_embryos.assignment.nucleus_table` this reads only the masks
+    -- no signal mask, no nearest-nucleus query, no gene columns -- so it can be
+    drawn straight after segmentation and says nothing about the assignment
+    parameters that have not been chosen yet.
+
+    ``linked`` decides what a row is, and it is the same distinction as
+    :attr:`SegmentedEmbryo.labels_are_3d`:
+
+    - ``True`` (``3d``, ``2d+link``) -- a label id means one object throughout, so
+      a row is one nucleus with a true 3D centroid and ``n_planes`` counts the
+      z-bins it spans.
+    - ``False`` (plain ``2d``) -- Cellpose restarts labels at 1 on every plane, so
+      a row is one label on one plane and ``n_planes`` is always 1.  Counting rows
+      here counts *appearances*, not nuclei.
+
+    Given the *same* label volume this reproduces ``nucleus_table``'s geometry
+    columns exactly -- but the two are normally given different volumes.  This
+    reads ``nuclear_masks``, so a centroid is the nucleus proper; the nucleus
+    table is built from the *assigned* masks, where each nucleus has grown by the
+    signal pixels given to it, and its centroids are pulled a little toward that
+    signal.
+
+    Returns columns ``nucleus_id, z_bin, x, y, z, n_voxels, n_planes, z_min,
+    z_max`` (plus ``x_um, y_um, z_um`` when ``voxel`` is given, and ``embryo_id``
+    when it is).  ``x, y, z`` are voxel indices in the binned frame, as in the
+    nucleus table; ``z_bin`` is the plane a row was found on and is the same as
+    ``z`` only for unlinked labels.
+    """
+    masks = np.asarray(masks)
+    if masks.ndim != 3:
+        raise ValueError(f"masks must be (Z, Y, X), got shape {masks.shape}")
+    n_z, height, width = masks.shape
+
+    flat = masks.reshape(-1)
+    voxels = np.flatnonzero(flat)
+    columns = [
+        "nucleus_id", "z_bin", "x", "y", "z", "n_voxels", "n_planes", "z_min", "z_max",
+    ]
+    if voxels.size == 0:
+        table = pd.DataFrame({name: pd.Series(dtype=float) for name in columns})
+        if embryo_id is not None:
+            table.insert(0, "embryo_id", pd.Series(dtype=object))
+        return table
+
+    label = flat[voxels].astype(np.int64)
+    plane = (voxels // (height * width)).astype(np.int64)
+    within = voxels % (height * width)
+    y = (within // width).astype(np.int64)
+    x = (within % width).astype(np.int64)
+
+    # One key per object.  Unlinked labels repeat across z, so the plane has to
+    # be part of the identity or two unrelated nuclei on different planes merge
+    # into one centroid halfway between them.
+    key = label if linked else label * n_z + plane
+    unique_keys, index = np.unique(key, return_inverse=True)
+
+    n_voxels = np.bincount(index)
+    mean_x = np.bincount(index, weights=x) / n_voxels
+    mean_y = np.bincount(index, weights=y) / n_voxels
+    mean_z = np.bincount(index, weights=plane) / n_voxels
+
+    # z extent: unique (object, plane) pairs, counted back onto the object.
+    pair = index.astype(np.int64) * n_z + plane
+    pair_unique = np.unique(pair)
+    pair_object = pair_unique // n_z
+    pair_plane = pair_unique % n_z
+    n_planes = np.bincount(pair_object, minlength=unique_keys.size)
+    z_min = np.full(unique_keys.size, n_z, dtype=np.int64)
+    z_max = np.full(unique_keys.size, -1, dtype=np.int64)
+    np.minimum.at(z_min, pair_object, pair_plane)
+    np.maximum.at(z_max, pair_object, pair_plane)
+
+    table = pd.DataFrame({
+        "nucleus_id": unique_keys if linked else unique_keys // n_z,
+        "z_bin": np.rint(mean_z).astype(int) if linked else (unique_keys % n_z),
+        "x": mean_x,
+        "y": mean_y,
+        "z": mean_z,
+        "n_voxels": n_voxels.astype(int),
+        "n_planes": n_planes.astype(int),
+        "z_min": z_min,
+        "z_max": z_max,
+    })
+
+    if voxel is not None:
+        table["x_um"] = table["x"] * voxel.xy_um
+        table["y_um"] = table["y"] * voxel.xy_um
+        table["z_um"] = table["z"] * voxel.z_um
+    if embryo_id is not None:
+        table.insert(0, "embryo_id", embryo_id)
+    return table

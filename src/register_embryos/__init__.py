@@ -50,13 +50,16 @@ __version__ = "0.1.0"
 
 from .assignment import (
     BACKGROUND_VALUE,
+    FATE_ORDER,
     EmbryoResult,
+    PixelFate,
     assign_signal_pixels_2d,
     assign_signal_pixels_3d,
     build_cohort_tables,
     build_nucleus_table,
     build_signal_mask,
     nucleus_table,
+    pixel_fate,
 )
 from .atlas import Atlas, align_atlases, atlas_diagnostics, build_atlas
 from .contrast import (
@@ -111,14 +114,21 @@ from .plotting import (
     plot_additive_3d,
     plot_gene_by_embryo,
     plot_gene_panels_2d,
+    plot_mask_planes,
+    plot_masks_3d,
+    plot_pixel_fate,
     plot_pointcloud_3d,
+    label_lut,
+    mask_overlay_rgb,
     plot_registration_2d,
     theme_for,
 )
 from .registration import (
     HAS_OPEN3D,
     ot_refine,
+    robot_refine,
     sinkhorn_plan,
+    unbalanced_sinkhorn_potentials,
     rotation_angles,
     RegistrationResult,
     icp_point_to_point,
@@ -147,13 +157,14 @@ from .thresholds import (
 from .segmentation import (
     SegmentedEmbryo,
     load_segmented,
+    mask_centroids,
     relabel_3d_from_2d,
     segment_2d,
     segment_3d,
     segment_cohort,
     segment_embryo,
 )
-from .widgets import PrepConfig, orientation_widget, prepare_widget
+from .widgets import PrepConfig, orientation_widget, prepare_widget, segmentation_widget
 from .workflow import (
     CohortOutputs,
     CohortWorkflow,
@@ -181,17 +192,19 @@ __all__ = [
     "ContrastLimits", "auto_contrast_limits", "apply_contrast",
     "apply_contrast_to_volumes", "contrast_widget", "preview_contrast", "log2_lift",
     # widgets
-    "PrepConfig", "prepare_widget", "orientation_widget",
+    "PrepConfig", "prepare_widget", "orientation_widget", "segmentation_widget",
     # segmentation
     "SegmentedEmbryo", "segment_2d", "segment_3d", "segment_embryo",
-    "segment_cohort", "relabel_3d_from_2d", "load_segmented",
+    "segment_cohort", "relabel_3d_from_2d", "load_segmented", "mask_centroids",
     # assignment
-    "BACKGROUND_VALUE", "EmbryoResult", "build_signal_mask",
+    "BACKGROUND_VALUE", "FATE_ORDER", "EmbryoResult", "PixelFate",
+    "build_signal_mask",
     "assign_signal_pixels_2d", "assign_signal_pixels_3d", "nucleus_table",
-    "build_nucleus_table", "build_cohort_tables",
+    "build_nucleus_table", "build_cohort_tables", "pixel_fate",
     # registration
     "HAS_OPEN3D", "RegistrationResult", "isotropic_downsample", "pca_align",
     "rotation_angles", "sinkhorn_plan", "ot_refine",
+    "unbalanced_sinkhorn_potentials", "robot_refine",
     "icp_point_to_point", "icp_residuals", "register_cohort", "register_frames",
     # atlas
     "Atlas", "build_atlas", "atlas_diagnostics", "align_atlases",
@@ -207,6 +220,8 @@ __all__ = [
     "plot_pointcloud_3d", "plot_additive_3d", "plot_additive_2d",
     "plot_additive_gene_2d",
     "plot_gene_panels_2d", "plot_gene_by_embryo", "plot_registration_2d",
+    "plot_pixel_fate", "plot_mask_planes", "plot_masks_3d",
+    "label_lut", "mask_overlay_rgb",
     # workflow
     "CohortWorkflow", "CohortOutputs", "run_cohort", "run_all_cohorts", "scan",
 ]

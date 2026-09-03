@@ -1453,3 +1453,330 @@ def test_reload_segmentation_refuses_mismatched_masks(tmp_path):
             np.zeros((3, 32, 32), dtype=int))          # wrong shape
     with pytest.raises(ValueError, match="cannot be reused"):
         wf.reload_segmentation(verbose=False)
+
+
+# ---------------------------------------------------------------------------
+# pixel_fate -- the dry run for build_tables
+# ---------------------------------------------------------------------------
+
+XY_UM = 0.5     # so a distance in pixels is half that in micrometres
+
+
+def _fate_embryo(gene: np.ndarray, masks: np.ndarray):
+    """A SegmentedEmbryo whose gene channel is given pixel by pixel.
+
+    The other helpers here blanket every gene channel with one value, which cannot
+    express "signal here, none there" -- and where the signal sits relative to a
+    nucleus is the whole question for assignment.
+    """
+    from register_embryos.imaging import EmbryoVolume, VoxelSize
+    from register_embryos.naming import parse_embryo_name
+    from register_embryos.segmentation import SegmentedEmbryo
+
+    volume = EmbryoVolume(
+        name=parse_embryo_name("20260410_1.5_wt_12s_dorsal_20X_hand2_tbx1_wt1a.nd2"),
+        binned_channels={
+            0: np.ones(gene.shape, np.float32),      # nuclear stain, unused here
+            1: gene.astype(np.float32),
+            2: np.zeros(gene.shape, np.float32),
+            3: np.zeros(gene.shape, np.float32),
+        },
+        voxel=VoxelSize(XY_UM, 1.0), bin_size=1, c_size=4, z_size=gene.shape[0],
+    )
+    return SegmentedEmbryo(volume=volume, nuclear_masks=masks, mode="2d")
+
+
+@pytest.fixture
+def fate_case():
+    """Three planes covering every fate, with known distances.
+
+    Plane 0: a nucleus, one bright pixel inside it, one 4 px away (2 um) and one
+    30 px away (15 um).  Plane 1: a nucleus, no signal.  Plane 2: signal but no
+    nucleus at all -- the case ``assign_signal_pixels_2d`` skips outright.
+    """
+    from register_embryos.assignment import pixel_fate
+
+    masks = np.zeros((3, 40, 40), dtype=int)
+    masks[0, 10:14, 10:14] = 1
+    masks[1, 10:14, 10:14] = 1
+
+    gene = np.zeros((3, 40, 40), np.float32)
+    gene[0, 11, 11] = 0.9        # inside the nucleus
+    gene[0, 17, 11] = 0.9        # 4 px below its edge -> 2.0 um
+    gene[0, 39, 11] = 0.9        # 26 px below its edge -> 13.0 um
+    gene[2, 20, 20] = 0.9        # on the plane with no nuclei
+
+    return pixel_fate(
+        _fate_embryo(gene, masks), signal_threshold=0.05,
+        max_assign_distance_um=5.0, verbose=False,
+    )
+
+
+def test_pixel_fate_separates_the_two_ways_signal_is_discarded(fate_case):
+    from register_embryos.assignment import FATE_CODES
+
+    fate = fate_case.fate
+    assert fate[0, 11, 11] == FATE_CODES["measured: in nucleus"]
+    assert fate[0, 12, 12] == FATE_CODES["nucleus, below cut"]
+    assert fate[0, 17, 11] == FATE_CODES["measured: assigned"]     # 2 um, inside 5
+    assert fate[0, 39, 11] == FATE_CODES["dropped: too far"]       # 13 um, outside 5
+    # A plane Cellpose found nothing on is its own category, not "too far": the
+    # assignment loop never reaches those pixels, so they are not in its count.
+    assert fate[2, 20, 20] == FATE_CODES["dropped: no nuclei on plane"]
+    assert fate_case.counts["dropped: too far"] == 1
+    assert fate_case.counts["dropped: no nuclei on plane"] == 1
+
+
+def test_pixel_fate_matches_what_assignment_actually_does(fate_case):
+    """The preview must be the same computation, not a second opinion.
+
+    Anything else and the figure could pass a cap the pipeline then rejects.
+    """
+    from register_embryos.assignment import (
+        FATE_CODES, assign_signal_pixels_2d, build_signal_mask,
+    )
+
+    masks = np.zeros((3, 40, 40), dtype=int)
+    masks[0, 10:14, 10:14] = 1
+    masks[1, 10:14, 10:14] = 1
+    gene = np.zeros((3, 40, 40), np.float32)
+    gene[0, 11, 11] = 0.9
+    gene[0, 17, 11] = 0.9
+    gene[0, 39, 11] = 0.9
+    gene[2, 20, 20] = 0.9
+    segmented = _fate_embryo(gene, masks)
+
+    signal = build_signal_mask(segmented.adjusted_channels, 0.05, verbose=False)
+    assigned = assign_signal_pixels_2d(
+        segmented.nuclear_masks, signal, xy_um=XY_UM, max_distance=5.0, verbose=False,
+    )
+    kept = np.isin(fate_case.fate, [
+        FATE_CODES["nucleus, below cut"],
+        FATE_CODES["measured: in nucleus"],
+        FATE_CODES["measured: assigned"],
+    ])
+    assert np.array_equal(assigned > 0, kept)
+
+
+def test_recut_moves_only_the_distance_decision(fate_case):
+    from register_embryos.assignment import FATE_CODES
+
+    loosened = fate_case.recut(50.0)
+    assert loosened.fate[0, 39, 11] == FATE_CODES["measured: assigned"]
+    assert loosened.counts["dropped: too far"] == 0
+    # The cap cannot rescue a plane with no nuclei, and cannot un-decide the
+    # threshold: every other code is untouched.
+    assert loosened.fate[2, 20, 20] == FATE_CODES["dropped: no nuclei on plane"]
+    for code in ("background", "nucleus, below cut", "measured: in nucleus",
+                 "dropped: no nuclei on plane"):
+        assert loosened.counts[code] == fate_case.counts[code]
+
+    tightened = fate_case.recut(1.0)
+    assert tightened.fate[0, 17, 11] == FATE_CODES["dropped: too far"]
+    assert fate_case.fate[0, 17, 11] == FATE_CODES["measured: assigned"]  # unmutated
+
+
+def test_uncapped_assignment_keeps_the_far_pixel(fate_case):
+    """What the pipeline did by default before the cap existed."""
+    from register_embryos.assignment import FATE_CODES
+
+    uncapped = fate_case.recut(None)
+    assert uncapped.fate[0, 39, 11] == FATE_CODES["measured: assigned"]
+    assert uncapped.dropped_fraction == 0.0
+
+
+def test_pixel_fate_summary_is_a_share_of_signal_not_of_the_frame(fate_case):
+    summary = fate_case.summary.set_index("fate")
+    # Background is ~99.9% of this frame, so a percentage of the frame would make
+    # every real category look like nothing.
+    assert summary.loc["dropped: too far", "pct_of_signal"] == pytest.approx(25.0)
+    assert summary.loc["dropped: too far", "pct_of_frame"] < 0.1
+    assert np.isnan(summary.loc["background", "pct_of_signal"])
+
+
+def test_plot_pixel_fate_renders_both_themes(fate_case, tmp_path):
+    import matplotlib
+    matplotlib.use("Agg")
+    from register_embryos.plotting import plot_pixel_fate
+
+    for mode in ("dark", "light"):
+        path = tmp_path / f"fate_{mode}.png"
+        plot_pixel_fate(fate_case, mode=mode, save_path=path)
+        assert path.exists()
+
+
+# ---------------------------------------------------------------------------
+# RobOT: robust (unbalanced) optimal transport, iterated
+# ---------------------------------------------------------------------------
+
+def _shell(n=600, radius=40.0, seed=0, axes=(1.0, 0.5, 0.25)):
+    """A hollow ellipsoid -- closer to a nucleus cloud than a gaussian blob.
+
+    The default is deliberately eccentric **in plane** (1 : 0.5). A near-circular
+    cloud does not pin its own in-plane angle -- that is the whole reason this
+    project sets orientation by hand -- so a fixture built from one would test
+    nothing about a registration's ability to recover a rotation. See
+    :func:`test_robot_cannot_resolve_a_rotationally_symmetric_cloud`.
+    """
+    rng = np.random.default_rng(seed)
+    directions = rng.normal(size=(n, 3))
+    directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+    return directions * radius * np.array(axes)
+
+
+def _rotation_z(degrees):
+    angle = np.deg2rad(degrees)
+    return np.array([[np.cos(angle), -np.sin(angle), 0.0],
+                     [np.sin(angle), np.cos(angle), 0.0],
+                     [0.0, 0.0, 1.0]])
+
+
+def test_unbalanced_potentials_reduce_to_balanced_at_large_reach():
+    """reach -> infinity is the classical constraint; the plan must match."""
+    from register_embryos.registration import (
+        sinkhorn_plan, unbalanced_sinkhorn_potentials,
+    )
+
+    rng = np.random.default_rng(3)
+    x, y = rng.normal(size=(40, 3)), rng.normal(size=(45, 3))
+    cost = 0.5 * ((x[:, None, :] - y[None, :, :]) ** 2).sum(-1)
+    a, b = np.full(40, 1 / 40), np.full(45, 1 / 45)
+
+    f, g = unbalanced_sinkhorn_potentials(cost, 0.5, a, b, reach=1e8, n_iter=500)
+    plan = a[:, None] * b[None, :] * np.exp((f[:, None] + g[None, :] - cost) / 0.5)
+    assert np.allclose(plan.sum(1), a, rtol=1e-4)      # marginals recovered
+    assert np.allclose(plan.sum(0), b, rtol=1e-4)
+    assert np.allclose(plan, sinkhorn_plan(cost, 0.5, n_iter=500), rtol=1e-3, atol=1e-9)
+
+
+def test_reach_lets_unmatched_mass_be_dropped():
+    """The 'robust' in RobOT: an outlier keeps its mass under balanced OT.
+
+    Balanced OT has no choice -- every source point must send its mass somewhere,
+    so a point with no counterpart is matched to whatever is nearest and votes in
+    the fit at full strength. That is the failure mode on embryos with unequal
+    nucleus counts.
+    """
+    from register_embryos.registration import unbalanced_sinkhorn_potentials
+
+    target = _shell(n=200)
+    source = np.vstack([target[:200], np.array([[900.0, 900.0, 900.0]])])  # 1 outlier
+    cost = 0.5 * ((source[:, None, :] - target[None, :, :]) ** 2).sum(-1)
+    a = np.full(len(source), 1 / len(source))
+    b = np.full(len(target), 1 / len(target))
+
+    def kept_mass(reach):
+        f, g = unbalanced_sinkhorn_potentials(cost, 25.0, a, b, reach=reach, n_iter=300)
+        plan = a[:, None] * b[None, :] * np.exp((f[:, None] + g[None, :] - cost) / 25.0)
+        return plan.sum(1) / a
+
+    balanced = kept_mass(None)
+    robust = kept_mass(40.0)
+    assert balanced[-1] == pytest.approx(1.0, abs=5e-3)   # forced to keep it all
+    assert robust[-1] < 0.1                                # priced out and dropped
+    assert robust[:-1].mean() > 5 * robust[-1]             # inliers keep theirs
+
+
+def test_robot_recovers_a_known_rigid_transform():
+    from scipy.spatial import cKDTree
+
+    from register_embryos.registration import robot_refine
+
+    target = _shell(n=800, seed=1)
+    rotation = _rotation_z(12.0)
+    source = target @ rotation.T + np.array([9.0, -6.0, 2.0])
+
+    _, transform = robot_refine(source, target, n_outer=8, verbose=False)
+    recovered = transform[:3, :3] @ rotation
+    assert np.allclose(recovered, np.eye(3), atol=0.05)
+    residual = float(cKDTree(target).query(_apply(source, transform))[0].mean())
+    assert residual < 0.5           # radius 40, so half a percent of the cloud
+
+
+def _apply(points, transform):
+    return points @ transform[:3, :3].T + transform[:3, 3]
+
+
+def test_robot_cannot_resolve_a_rotationally_symmetric_cloud():
+    """The limit worth knowing before trusting it on this project's data.
+
+    RobOT is a better correspondence rule, not a different objective: a cloud that
+    is nearly a disc of revolution scores a wrong in-plane angle about as well as
+    the right one, and no amount of robustness or annealing changes that. On a
+    1 : 0.85 in-plane ellipse it recovers 6 of 12 degrees; on 1 : 0.5 it recovers
+    all of them. This is why orientation stays a manual, image-based decision.
+    """
+    from register_embryos.registration import robot_refine, rotation_angles
+
+    for axes, recovered_at_least in [((1.0, 0.5, 0.25), 11.0), ((1.0, 0.85, 0.25), 0.0)]:
+        target = _shell(n=800, seed=1, axes=axes)
+        source = target @ _rotation_z(12.0).T
+        _, transform = robot_refine(source, target, n_outer=8, verbose=False)
+        recovered = -rotation_angles(transform)[0]
+        if recovered_at_least:
+            assert recovered > recovered_at_least
+        else:
+            assert recovered < 9.0        # visibly short of the true 12 degrees
+
+
+def test_robot_improves_where_the_one_shot_refine_cannot():
+    """The reason for the outer loop.
+
+    ``ot_refine`` computes one plan and solves once, so from a starting point that
+    is already at the fixed point of its own correspondence rule it has nothing
+    left to do -- and the entropic barycentric projection contracts, so what it
+    does apply tends to make the residual worse. RobOT recomputes the plan from the
+    moved cloud, so it can keep going.
+    """
+    from register_embryos.registration import ot_refine, robot_refine
+
+    target = _shell(n=700, seed=2)
+    rotation = _rotation_z(9.0)
+    source = target @ rotation.T + np.array([12.0, 5.0, 0.0])
+
+    def residual(points):
+        from scipy.spatial import cKDTree
+        return float(cKDTree(target).query(points)[0].mean())
+
+    start = residual(source)
+    one_shot, _ = ot_refine(source, target, max_rotation_deg=None, verbose=False)
+    iterated, _ = robot_refine(source, target, n_outer=8, verbose=False)
+
+    assert residual(iterated) < residual(one_shot)
+    assert residual(iterated) < 0.25 * start
+
+
+def test_robot_honours_a_rotation_cap_when_asked():
+    """Unconstrained by default, but constrainable for a hand-oriented cohort."""
+    from register_embryos.registration import robot_refine, rotation_angles
+
+    target = _shell(n=600, seed=4)
+    source = target @ _rotation_z(40.0).T
+
+    _, free = robot_refine(source, target, n_outer=6, verbose=False)
+    _, capped = robot_refine(source, target, n_outer=6, max_rotation_deg=5.0,
+                             inplane_only=True, verbose=False)
+    assert abs(rotation_angles(free)[0]) > 20
+    assert abs(rotation_angles(capped)[0]) <= 5.0 * 6 + 1e-6   # per-iteration cap
+    assert rotation_angles(capped)[1] == pytest.approx(0.0, abs=1e-6)  # in-plane only
+
+
+def test_ot_kwargs_can_override_the_constraint(tmp_path):
+    """Regression: register_frames passed inplane_only both explicitly and via
+    ot_kwargs, so the documented way to unconstrain the OT stage raised TypeError.
+    """
+    from register_embryos.registration import register_frames
+
+    rng = np.random.default_rng(5)
+    frames = {}
+    for i, name in enumerate(["a", "b"]):
+        cloud = _shell(n=300, seed=i)
+        frames[name] = pd.DataFrame(cloud, columns=["x", "y", "z"]).assign(
+            embryo_id=name, nucleus_id=np.arange(len(cloud)),
+        )
+    result = register_frames(
+        frames, reference_embryo_id="a", refine_with_ot=True,
+        ot_kwargs={"inplane_only": False, "max_rotation_deg": None},
+        verbose=False,
+    )
+    assert not result.registered.empty

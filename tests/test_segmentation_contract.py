@@ -356,3 +356,70 @@ def test_available_cpus_is_never_zero(monkeypatch):
 
 def test_available_cpus_matches_reality_here():
     assert 1 <= segmentation.available_cpus() <= (segmentation.os.cpu_count() or 1)
+
+
+def test_workflow_segment_forwards_the_channel_to_cellpose(monkeypatch, tmp_path):
+    """The regression: ``channel`` used to index the *volume list*, never Cellpose.
+
+    So ``wf.segment(channel=1)`` silently segmented channel 0 anyway -- and on a
+    one-embryo cohort ``channel=1`` was an IndexError rather than a wrong answer,
+    which is the only reason it never produced quietly bad masks.
+    """
+    from register_embryos.naming import CohortKey, parse_embryo_name
+    from register_embryos import workflow as workflow_module
+    from register_embryos.workflow import CohortWorkflow
+
+    seen = {}
+
+    def fake_segment_cohort(volumes, **kwargs):
+        seen.update(kwargs)
+        return []
+
+    monkeypatch.setattr(workflow_module, "segment_cohort", fake_segment_cohort)
+
+    embryo = parse_embryo_name("20260410_1.5_wt_12s_dorsal_20X_a_b_c.nd2")
+    wf = CohortWorkflow(CohortKey("wt", "12s", "dorsal", "20X"), [embryo], tmp_path)
+    wf.volumes = [_volume(bin_size=7)]
+
+    wf.segment(mode="2d+link", channel=1, verbose=False)
+    assert seen["nuclei_channel"] == 1
+    assert wf._params["segmentation_channel"] == 1
+
+    wf.segment(mode="2d+link", verbose=False)
+    assert seen["nuclei_channel"] == 0
+
+
+def test_the_binning_check_does_not_depend_on_the_channel(monkeypatch, tmp_path):
+    """A single-embryo cohort must still reach the 3D refusal with channel=1."""
+    from register_embryos.naming import CohortKey, parse_embryo_name
+    from register_embryos.workflow import CohortWorkflow
+
+    embryo = parse_embryo_name("20260410_1.5_wt_12s_dorsal_20X_a_b_c.nd2")
+    wf = CohortWorkflow(CohortKey("wt", "12s", "dorsal", "20X"), [embryo], tmp_path)
+    wf.volumes = [_volume(bin_size=7)]
+    with pytest.raises(ValueError, match="unbinned z-stack"):
+        wf.segment(mode="3d", channel=1, verbose=False)
+
+
+def test_the_segmented_channel_is_recorded_in_the_sidecar(monkeypatch, tmp_path):
+    """A channel-1 run writes masks under the same name as a channel-0 run."""
+    import json
+
+    from register_embryos.imaging import EmbryoVolume, VoxelSize
+    from register_embryos.naming import parse_embryo_name
+
+    monkeypatch.setattr(
+        segmentation, "segment_2d",
+        lambda vol, **kw: np.ones(vol.shape, dtype=int),
+    )
+    vol = EmbryoVolume(
+        name=parse_embryo_name("20260410_1.5_wt_12s_dorsal_20X_a_b_c.nd2"),
+        binned_channels={0: np.zeros((2, 8, 8), np.float32),
+                         1: np.zeros((2, 8, 8), np.float32)},
+        voxel=VoxelSize(1.0, 1.0), bin_size=1, c_size=2, z_size=2,
+    )
+    segmentation.segment_embryo(
+        vol, mode="2d", nuclei_channel=1, output_dir=tmp_path, verbose=False
+    )
+    sidecar = json.loads((tmp_path / f"{vol.embryo_id}_gene_map.json").read_text())
+    assert sidecar["nuclei_channel"] == 1

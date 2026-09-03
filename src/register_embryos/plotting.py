@@ -22,6 +22,7 @@ Two colouring schemes:
 
 from __future__ import annotations
 
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -30,7 +31,7 @@ import numpy as np
 import pandas as pd
 
 # Safe at module level: thresholds imports plotting only lazily, inside functions.
-from .thresholds import DEFAULT_THRESHOLD, resolve_gene_cuts
+from .thresholds import DEFAULT_THRESHOLD, NON_GENE_COLUMNS, resolve_gene_cuts
 
 __all__ = [
     "GENE_RGB",
@@ -48,6 +49,12 @@ __all__ = [
     "plot_registration_2d",
     "plot_gene_panels_2d",
     "plot_gene_by_embryo",
+    "plot_pixel_fate",
+    "plot_mask_planes",
+    "plot_masks_3d",
+    "label_lut",
+    "mask_overlay_rgb",
+    "FATE_COLORS",
 ]
 
 #: Default hues for the genes in this project's panels.  Chosen to stay
@@ -136,10 +143,24 @@ def theme_for(mode: str) -> Theme:
 
 
 def gene_color(gene: str, index: int = 0) -> np.ndarray:
-    """RGB triple for a gene, falling back to a cycled palette."""
+    """RGB triple for a gene. Stable: the same gene is the same colour everywhere.
+
+    A gene outside :data:`GENE_RGB` gets a fallback chosen from a hash of its *name*,
+    not from its position in the list being plotted. Position-based fallbacks meant a
+    gene was one colour in the whole-panel figure and another in a single-gene figure
+    of the same data, which makes two figures of one cohort impossible to read
+    together.
+
+    ``index`` is accepted and ignored, so existing callers keep working. Two unknown
+    genes can collide on one fallback colour; :func:`_resolve_genes` warns when that
+    happens in a figure, and the fix is to give the gene an entry in
+    :data:`GENE_RGB`.
+    """
     if gene in GENE_RGB:
         return GENE_RGB[gene]
-    return FALLBACK_RGB[index % len(FALLBACK_RGB)]
+    # crc32, not hash(): the built-in string hash is salted per process, so the
+    # colour would change between sessions.
+    return FALLBACK_RGB[zlib.crc32(gene.encode("utf-8")) % len(FALLBACK_RGB)]
 
 
 def _hex(rgb: Sequence[float]) -> str:
@@ -163,18 +184,48 @@ def _resolve_coords(df: pd.DataFrame, coords: Optional[Sequence[str]]) -> List[s
     return ["x", "y", "z"]
 
 
-def _resolve_genes(df: pd.DataFrame, genes: Optional[Sequence[str]]) -> List[str]:
+def _resolve_genes(
+    df: pd.DataFrame, genes: Optional[str | Sequence[str]]
+) -> List[str]:
+    """Which genes to draw: every gene channel by default, or the ones asked for.
+
+    Accepts ``None`` (all), one gene as a bare string, or a sequence. The bare string
+    matters because ``genes="wt1a"`` is the obvious way to ask for one gene, and
+    iterating a string yields its characters -- which silently matched nothing and
+    produced a blank figure.
+
+    A requested gene that is not a column is an error rather than a quiet omission,
+    for the same reason: asking for one gene and getting an empty panel should say so.
+    """
     if genes is not None:
-        return [g for g in genes if g in df.columns]
-    skip = {
-        "embryo_id", "nucleus_id", "atlas_point_id", "n_voxels", "n_source_embryos",
-        "neighbor_radius", "x", "y", "z", "x_reg", "y_reg", "z_reg",
-        "x_um", "y_um", "z_um",
-    }
-    return [
-        c for c in df.columns
-        if c not in skip and pd.api.types.is_numeric_dtype(df[c])
-    ]
+        requested = [genes] if isinstance(genes, str) else list(genes)
+        missing = [g for g in requested if g not in df.columns]
+        if missing:
+            available = [
+                c for c in df.columns
+                if c not in NON_GENE_COLUMNS and pd.api.types.is_numeric_dtype(df[c])
+            ]
+            raise ValueError(
+                f"gene(s) not in the table: {missing}. Available: {available}"
+            )
+        resolved = requested
+    else:
+        resolved = [
+            c for c in df.columns
+            if c not in NON_GENE_COLUMNS and pd.api.types.is_numeric_dtype(df[c])
+        ]
+
+    # Two genes sharing a fallback colour would be indistinguishable in the figure.
+    seen: Dict[str, str] = {}
+    for gene in resolved:
+        key = _hex(gene_color(gene))
+        if key in seen and seen[key] != gene:
+            print(
+                f"  [WARN] {gene!r} and {seen[key]!r} both draw as {key}; give one an "
+                f"entry in register_embryos.plotting.GENE_RGB to tell them apart"
+            )
+        seen[key] = gene
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -1164,4 +1215,617 @@ def plot_registration_2d(
     else:
         fig.tight_layout()
     _save_fig(fig, theme, save_path)
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# What assignment will discard
+# ---------------------------------------------------------------------------
+
+#: Colours for the before/after panels, per theme.  Background sits at the paper
+#: colour so it takes no attention, tissue is a dim grey underlay, kept signal is
+#: cool and discarded signal is hot -- a plane is readable without the legend.
+FATE_COLORS: Dict[str, Dict[str, str]] = {
+    "dark": {
+        "background": "#0a0a0a",
+        "tissue": "#333333",
+        "kept": "#59b0ea",
+        "too_far": "#ff3b1f",
+        "no_nuclei": "#ffa726",
+    },
+    "light": {
+        "background": "#ffffff",
+        "tissue": "#dcdcdc",
+        "kept": "#1f6fb2",
+        "too_far": "#d62206",
+        "no_nuclei": "#e08c00",
+    },
+}
+
+
+def _fate_crop(fate_volume: np.ndarray, margin: int = 12) -> Tuple[slice, slice]:
+    """Bounding box of everything that is not background, shared across planes.
+
+    One box for the whole stack rather than one per plane, so a domain does not
+    appear to move between panels when it is only the crop that changed.
+    """
+    occupied = np.nonzero((fate_volume > 0).any(axis=0))
+    if occupied[0].size == 0:
+        return slice(None), slice(None)
+    y0, y1 = int(occupied[0].min()), int(occupied[0].max())
+    x0, x1 = int(occupied[1].min()), int(occupied[1].max())
+    height, width = fate_volume.shape[1], fate_volume.shape[2]
+    return (
+        slice(max(y0 - margin, 0), min(y1 + margin + 1, height)),
+        slice(max(x0 - margin, 0), min(x1 + margin + 1, width)),
+    )
+
+
+def _fate_rgb(
+    plane: np.ndarray,
+    colors: Dict[str, str],
+    codes: Dict[str, int],
+    keep_only: bool,
+    highlight_removed: bool,
+) -> np.ndarray:
+    """One plane of a fate map as an RGB image.
+
+    ``keep_only`` is the *after* panel: the discarded pixels are simply not drawn,
+    which is what the nucleus table sees.  In the *before* panel they are present,
+    optionally tinted by which way they are about to go.
+    """
+    import matplotlib.colors as mcolors
+
+    def rgb(name: str) -> np.ndarray:
+        return np.array(mcolors.to_rgb(colors[name]), dtype=np.float32)
+
+    image = np.broadcast_to(
+        rgb("background"), (*plane.shape, 3)
+    ).copy()
+    # Tissue first, so signal drawn over it always wins.
+    image[plane == codes["nucleus, below cut"]] = rgb("tissue")
+
+    kept = (plane == codes["measured: in nucleus"]) | (
+        plane == codes["measured: assigned"]
+    )
+    image[kept] = rgb("kept")
+
+    if not keep_only:
+        too_far = plane == codes["dropped: too far"]
+        blank = plane == codes["dropped: no nuclei on plane"]
+        image[too_far] = rgb("too_far" if highlight_removed else "kept")
+        image[blank] = rgb("no_nuclei" if highlight_removed else "kept")
+    return image
+
+
+def plot_pixel_fate(
+    fate,
+    mode: str = "light",
+    z: Optional[Sequence[int]] = None,
+    max_panels: int = 6,
+    n_cols: int = 2,
+    panel_size: float = 3.4,
+    crop: bool = True,
+    highlight_removed: bool = True,
+    show_distance_hist: bool = True,
+    suptitle: str = "",
+    save_path: Optional[str | Path] = None,
+):
+    """Signal pixels before and after assignment filtering, plane by plane.
+
+    Takes a :class:`~register_embryos.assignment.PixelFate` -- run
+    :func:`~register_embryos.assignment.pixel_fate` (or
+    ``wf.preview_assignment(...)``) *before* ``build_tables`` and set its two
+    parameters by looking at this.  Neither is visible in the nucleus table: a
+    table built with a cap ten times too tight still has one row per nucleus and a
+    plausible number in every column.
+
+    Each plane gets two panels.  **before** is every pixel the threshold called
+    signal; **after** is only what reaches the nucleus table.  With
+    ``highlight_removed`` (the default) the before panel colours each pixel by
+    where it is headed -- red beyond the distance cap, orange on a plane Cellpose
+    found no nuclei on -- so the difference between the panels can be located
+    rather than hunted for.  Nothing is added or hidden either way; those pixels
+    are genuinely there before filtering.
+
+    What to look for:
+
+    - **Red away from the tissue** is the cap working: debris that would otherwise
+      have been measured into whichever nucleus happened to be nearest.
+    - **Red inside the tissue**, especially a whole domain of it, is the cap set
+      too tight -- real signal being deleted.  ``fate.recut(40.0)`` redraws at a
+      new cap for free, with no second KD-tree query.
+    - **Orange** marks planes with no nuclei at all.  At the top and bottom of a
+      stack that is expected; in the middle it is a segmentation failure, and
+      ``build_tables`` never mentions it -- those pixels are not even counted as
+      dropped, they simply never enter the assignment loop.
+
+    The histogram is the quantitative version, and the thing to choose the cap
+    from: nucleus distance for every signal pixel outside a nucleus, with the cap
+    drawn on it.  A cap in the valley past the tissue shoulder keeps perinuclear
+    signal and drops debris; a cap on the shoulder is cutting into tissue.
+
+    Args:
+        z: which planes to draw.  Default is the planes carrying signal, evenly
+            spaced down to ``max_panels``.
+        n_cols: how many *plane pairs* per row, so the figure is ``2 * n_cols``
+            panels wide.
+        crop: zoom to the stack's occupied bounding box, shared by every panel.
+            ``False`` shows the full frame -- the honest view of how far out
+            debris actually sits.
+    """
+    import matplotlib
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+
+    from .assignment import FATE_CODES
+
+    matplotlib.rcParams["pdf.fonttype"] = 42
+    theme = theme_for(mode)
+    colors = FATE_COLORS["dark" if theme.is_dark else "light"]
+    volume = fate.fate
+
+    if z is None:
+        carrying = [
+            index for index in range(volume.shape[0])
+            if (volume[index] > FATE_CODES["nucleus, below cut"]).any()
+        ]
+        if not carrying:
+            carrying = list(range(volume.shape[0]))
+        if len(carrying) > max_panels:
+            picks = np.linspace(0, len(carrying) - 1, max_panels).round().astype(int)
+            carrying = [carrying[i] for i in picks]
+        planes = carrying
+    else:
+        planes = [int(index) for index in z]
+    if not planes:
+        raise ValueError("no planes to draw")
+
+    rows_y, rows_x = _fate_crop(volume) if crop else (slice(None), slice(None))
+
+    n_cols = max(1, min(n_cols, len(planes)))
+    n_rows = int(np.ceil(len(planes) / n_cols))
+    hist_rows = 1 if show_distance_hist else 0
+    fig = plt.figure(
+        figsize=(panel_size * 2 * n_cols, panel_size * n_rows + 2.8 * hist_rows + 1.0),
+        facecolor=theme.paper,
+    )
+    grid = fig.add_gridspec(
+        n_rows + hist_rows, 2 * n_cols,
+        height_ratios=[1] * n_rows + ([0.75] * hist_rows),
+    )
+
+    for position, plane_index in enumerate(planes):
+        plane = volume[plane_index]
+        row, pair = divmod(position, n_cols)
+        signal = int((plane > FATE_CODES["nucleus, below cut"]).sum())
+        too_far = int((plane == FATE_CODES["dropped: too far"]).sum())
+        blank = int((plane == FATE_CODES["dropped: no nuclei on plane"]).sum())
+        kept = signal - too_far - blank
+        share = 100.0 * kept / signal if signal else 100.0
+
+        # The removal breakdown belongs on the *before* title, beside the pixels it
+        # describes -- those are the red ones in that panel.  Both titles then fit
+        # on one line, which two rows of panels cannot afford to lose.
+        reasons = []
+        if too_far:
+            reasons.append(f"{too_far:,} too far")
+        if blank:
+            reasons.append(f"{blank:,} no nuclei")
+        before = f"z {plane_index} before — {signal:,} signal px"
+        if reasons:
+            before += f", {', '.join(reasons)}"
+        titles = [before, f"z {plane_index} after — {kept:,} kept ({share:.1f}%)"]
+
+        for offset, (title, keep_only) in enumerate(zip(titles, (False, True))):
+            ax = fig.add_subplot(grid[row, 2 * pair + offset])
+            image = _fate_rgb(
+                plane[rows_y, rows_x], colors, FATE_CODES,
+                keep_only=keep_only, highlight_removed=highlight_removed,
+            )
+            ax.imshow(image, interpolation="nearest")
+            ax.set_xticks([]); ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_color(theme.grid)
+            ax.set_title(title, color=theme.font, fontsize=9)
+
+    legend = [
+        Patch(facecolor=colors["kept"], edgecolor=theme.grid, label="kept: measured"),
+        Patch(facecolor=colors["tissue"], edgecolor=theme.grid,
+              label="nucleus, below cut"),
+    ]
+    if highlight_removed:
+        # Only for reasons that actually occur in the planes drawn: a legend entry
+        # for a colour nowhere in the figure reads as "look harder", and the two
+        # discard reasons are exactly what the reader is scanning for.
+        drawn = volume[planes]
+        if (drawn == FATE_CODES["dropped: too far"]).any():
+            legend.append(Patch(
+                facecolor=colors["too_far"], edgecolor=theme.grid,
+                label=("removed: beyond cap" if fate.max_assign_distance_um is None
+                       else f"removed: beyond {fate.max_assign_distance_um:g} um"),
+            ))
+        if (drawn == FATE_CODES["dropped: no nuclei on plane"]).any():
+            legend.append(Patch(
+                facecolor=colors["no_nuclei"], edgecolor=theme.grid,
+                label="removed: no nuclei on plane",
+            ))
+    fig.legend(
+        handles=legend, loc="lower center", ncol=len(legend), frameon=False,
+        fontsize=8, labelcolor=theme.font, bbox_to_anchor=(0.5, 0.0),
+    )
+
+    if show_distance_hist:
+        ax = fig.add_subplot(grid[n_rows, :])
+        ax.set_facecolor(theme.paper)
+        distances = fate.distances_um
+        if distances.size:
+            upper = float(np.quantile(distances, 0.999))
+            bins = np.linspace(0.0, max(upper, 1e-6), 120)
+            cap = fate.max_assign_distance_um
+            below = distances if cap is None else distances[distances <= cap]
+            above = distances[:0] if cap is None else distances[distances > cap]
+            ax.hist(below, bins=bins, color=colors["kept"], log=True, label="kept")
+            if above.size:
+                ax.hist(above, bins=bins, color=colors["too_far"], log=True,
+                        label="removed: too far")
+            if cap is not None:
+                ax.axvline(cap, color=theme.font, linestyle="--", linewidth=1.2)
+                ax.text(
+                    cap, ax.get_ylim()[1],
+                    f"  cap {cap:g} um — {100 * fate.dropped_fraction:.2f}% removed",
+                    color=theme.font, fontsize=8, va="top", ha="left",
+                )
+            ax.legend(frameon=False, fontsize=8, labelcolor=theme.font)
+        else:
+            ax.text(0.5, 0.5, "every signal pixel is inside a nucleus",
+                    ha="center", va="center", transform=ax.transAxes,
+                    color=theme.axis_label, fontsize=9)
+        ax.set_title(
+            "nucleus distance of every signal pixel outside a nucleus",
+            color=theme.font, fontsize=9,
+        )
+        ax.set_xlabel("distance to nearest nucleus (um)", color=theme.axis_label,
+                      fontsize=9)
+        ax.set_ylabel("signal pixels", color=theme.axis_label, fontsize=9)
+        ax.tick_params(colors=theme.axis_label, labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color(theme.grid)
+
+    fig.suptitle(
+        suptitle or (
+            f"{fate.embryo_id} — threshold {fate.signal_threshold}, "
+            + ("uncapped" if fate.max_assign_distance_um is None
+               else f"cap {fate.max_assign_distance_um:g} um")
+        ),
+        color=theme.font, fontsize=12,
+    )
+    # h_pad keeps a row's titles clear of the panels above it; the default leaves
+    # them touching once there are three rows of square panels.
+    fig.tight_layout(rect=(0, 0.04, 1, 0.98), h_pad=1.8)
+    _save_fig(fig, theme, save_path)
+    return fig
+
+
+# --------------------------------------------------------------------------
+# Segmentation views: the label volume itself, before anything is measured
+# --------------------------------------------------------------------------
+
+def label_lut(max_label: int, seed: int = 0) -> np.ndarray:
+    """Random but *stable* colour per label id, as an ``(max_label + 1, 3)`` LUT.
+
+    Seeded on the id rather than on drawing order, so a nucleus keeps its colour
+    from plane to plane and between figures.  With linked labels that is what
+    lets a nucleus be followed down z by eye; with per-plane labels it is a
+    reminder that the same colour on two planes means nothing.
+    """
+    import matplotlib.colors as mcolors
+
+    rng = np.random.default_rng(seed)
+    count = int(max_label) + 1
+    hsv = np.stack([
+        rng.uniform(0.0, 1.0, count),
+        rng.uniform(0.55, 0.95, count),
+        rng.uniform(0.75, 1.00, count),
+    ], axis=1)
+    lut = mcolors.hsv_to_rgb(hsv).astype(np.float32)
+    lut[0] = 0.0
+    return lut
+
+
+def mask_overlay_rgb(
+    labels: np.ndarray,
+    image: Optional[np.ndarray] = None,
+    style: str = "outline",
+    alpha: float = 0.45,
+    lut: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """One plane of labels drawn over one plane of image, as an RGB array.
+
+    Args:
+        style: ``"outline"`` draws each mask's inner boundary only, which is the
+            view for judging whether a boundary is in the right place;
+            ``"filled"`` tints the interior as well, which is the view for
+            spotting merged or missed nuclei; ``"none"`` returns the bare image.
+        alpha: interior tint strength for ``"filled"``.
+    """
+    from skimage.segmentation import find_boundaries
+
+    if image is None:
+        base = np.zeros((*labels.shape, 3), dtype=np.float32)
+    else:
+        grey = np.clip(np.asarray(image, dtype=np.float32), 0.0, 1.0)
+        base = np.repeat(grey[:, :, None], 3, axis=2)
+    if style == "none":
+        return base
+
+    if lut is None:
+        lut = label_lut(int(labels.max()))
+    colors = lut[np.clip(labels, 0, lut.shape[0] - 1)]
+
+    if style == "filled":
+        inside = labels > 0
+        base[inside] = (1.0 - alpha) * base[inside] + alpha * colors[inside]
+    elif style != "outline":
+        raise ValueError(f"style must be 'outline', 'filled' or 'none', got {style!r}")
+
+    edge = find_boundaries(labels, mode="inner")
+    base[edge] = colors[edge]
+    return base
+
+
+def _mask_source(segmented, channel: int = 0):
+    """Accept a SegmentedEmbryo or a bare label array, uniformly.
+
+    Returns ``(masks, image_stack_or_None, embryo_id, mode, voxel, channel_label)``.
+    """
+    masks = getattr(segmented, "nuclear_masks", None)
+    if masks is None:
+        return np.asarray(segmented), None, "", "", None, ""
+
+    channels = segmented.adjusted_channels
+    image = channels.get(channel)
+    if channel == 0:
+        channel_label = "0 — nuclei"
+    else:
+        channel_label = f"{channel} — {segmented.gene_map.get(channel, f'ch{channel}')}"
+    return (
+        masks, image, segmented.embryo_id, segmented.mode,
+        segmented.volume.binned_voxel, channel_label,
+    )
+
+
+def plot_mask_planes(
+    segmented,
+    z: Optional[Sequence[int]] = None,
+    channel: int = 0,
+    style: str = "outline",
+    compare: bool = False,
+    max_panels: int = 6,
+    n_cols: int = 3,
+    mode: str = "dark",
+    panel_size: float = 3.6,
+    crop: bool = False,
+    alpha: float = 0.45,
+    suptitle: str = "",
+    save_path: Optional[str | Path] = None,
+):
+    """Nuclear masks drawn on the image, plane by plane -- the static figure.
+
+    The saveable counterpart of
+    :func:`~register_embryos.widgets.segmentation_widget`: same rendering, a
+    fixed set of planes instead of a slider.  Takes a
+    :class:`~register_embryos.segmentation.SegmentedEmbryo` (or a bare
+    ``(Z, Y, X)`` label array, which then draws on black).
+
+    What to look for:
+
+    - **Nuclei with no outline** -- segmentation missed them, and every signal
+      pixel they carry will be assigned to a neighbour instead.
+    - **One outline over two nuclei** -- a merge, which no amount of later
+      thresholding undoes.  2D linking cannot split it either; only a real 3D
+      pass can.
+    - **The last few planes** -- masks usually thin out at the bottom of a dorsal
+      stack.  Planes with no nuclei at all are where signal is silently dropped
+      (see :func:`plot_pixel_fate`).
+
+    Args:
+        z: which z-bins to draw.  Default is the planes carrying labels, evenly
+            spaced down to ``max_panels``.
+        channel: which channel to draw underneath.  0 is what Cellpose saw,
+            unless ``segment(channel=...)`` said otherwise.
+        compare: draw the bare image beside each overlay, doubling the panels.
+        crop: zoom to the bounding box of all labels, shared across panels.
+    """
+    import matplotlib
+    import matplotlib.pyplot as plt
+
+    matplotlib.rcParams["pdf.fonttype"] = 42
+    theme = theme_for(mode)
+    masks, images, embryo_id, seg_mode, _, channel_label = _mask_source(segmented, channel)
+
+    per_plane = np.array([int(np.unique(plane[plane > 0]).size) for plane in masks])
+    if z is None:
+        carrying = np.flatnonzero(per_plane > 0).tolist() or list(range(masks.shape[0]))
+        if len(carrying) > max_panels:
+            picks = np.linspace(0, len(carrying) - 1, max_panels).round().astype(int)
+            carrying = [carrying[i] for i in picks]
+        planes = carrying
+    else:
+        planes = [int(index) for index in z]
+    if not planes:
+        raise ValueError("no planes to draw")
+
+    if crop:
+        occupied = np.nonzero((masks > 0).any(axis=0))
+        if occupied[0].size:
+            margin = 12
+            rows = slice(max(int(occupied[0].min()) - margin, 0),
+                         min(int(occupied[0].max()) + margin + 1, masks.shape[1]))
+            cols = slice(max(int(occupied[1].min()) - margin, 0),
+                         min(int(occupied[1].max()) + margin + 1, masks.shape[2]))
+        else:
+            rows = cols = slice(None)
+    else:
+        rows = cols = slice(None)
+
+    lut = label_lut(int(masks.max()))
+    per_row = max(1, min(n_cols, len(planes)))
+    n_rows = int(np.ceil(len(planes) / per_row))
+    wide = 2 if compare else 1
+
+    fig, axes = plt.subplots(
+        n_rows, per_row * wide,
+        figsize=(panel_size * per_row * wide, panel_size * n_rows + 0.9),
+        facecolor=theme.paper, squeeze=False,
+    )
+    for ax in axes.ravel():
+        ax.set_facecolor(theme.paper)
+        ax.axis("off")
+
+    for position, plane_index in enumerate(planes):
+        row, column = divmod(position, per_row)
+        image = images[plane_index][rows, cols] if images is not None else None
+        labels = masks[plane_index][rows, cols]
+
+        if compare:
+            bare = axes[row][column * 2]
+            bare.imshow(
+                np.zeros((*labels.shape, 3)) if image is None else image,
+                cmap=None if image is None else "gray", vmin=0, vmax=1,
+            )
+            bare.set_title(f"z-bin {plane_index} — image", fontsize=9, color=theme.font)
+        target = axes[row][column * wide + (1 if compare else 0)]
+        target.imshow(mask_overlay_rgb(labels, image, style=style, alpha=alpha, lut=lut))
+        target.set_title(
+            f"z-bin {plane_index} — {per_plane[plane_index]:,} labels",
+            fontsize=9, color=theme.font,
+        )
+
+    identity = " ".join(part for part in (embryo_id, f"({seg_mode})" if seg_mode else "") if part)
+    default = f"{identity} — masks on ch {channel_label}" if identity else "nuclear masks"
+    fig.suptitle(suptitle or default, fontsize=10, color=theme.font, wrap=True)
+    fig.tight_layout()
+    _save_fig(fig, theme, save_path)
+    return fig
+
+
+def plot_masks_3d(
+    segmented,
+    mode: str = "dark",
+    color_by: str = "z",
+    size_by_voxels: bool = True,
+    marker_size: float = 3.0,
+    in_um: bool = True,
+    title: str = "",
+    save_path: Optional[str | Path] = None,
+    width: int = 900,
+    height: int = 700,
+):
+    """Every segmented nucleus as a point in 3D -- the cloud, before any gene.
+
+    One marker per object in the label volume, positioned at its centroid.  This
+    is the cloud that ICP will actually be handed, so it is the right place to
+    see whether it has structure or is a slab of duplicates: with plain ``2d``
+    labels one nucleus contributes one point *per plane*, stacked in z, and that
+    is visible here and nowhere else.  The subtitle states which case you are in.
+
+    Args:
+        color_by: ``"z"`` (depth), ``"n_voxels"`` (size, so merges stand out),
+            ``"n_planes"`` (how far an object spans in z) or ``"random"`` (a
+            distinct colour per label, for telling neighbours apart).
+        size_by_voxels: scale markers by the cube root of the voxel count, so
+            volume reads as radius rather than as area.
+        in_um: plot micrometres from the binned voxel size.  ``False`` keeps
+            voxel indices, where z is compressed by the binning factor.
+    """
+    import plotly.graph_objects as go
+
+    from .segmentation import mask_centroids
+
+    theme = theme_for(mode)
+    masks, _, embryo_id, seg_mode, voxel, _ = _mask_source(segmented)
+    linked = seg_mode in ("3d", "2d+link") if seg_mode else True
+
+    table = mask_centroids(
+        masks, voxel=voxel if (in_um and voxel is not None) else None, linked=linked
+    )
+    if table.empty:
+        raise ValueError("no labels in this mask volume")
+
+    if in_um and "x_um" in table.columns:
+        coords = ("x_um", "y_um", "z_um")
+        labels = ("x (µm)", "y (µm)", "z (µm)")
+    else:
+        coords = ("x", "y", "z")
+        labels = ("x (voxels)", "y (voxels)", "z (bins)")
+
+    if color_by == "random":
+        lut = label_lut(int(table["nucleus_id"].max()))
+        color = [
+            "rgb({},{},{})".format(*(255 * lut[int(i)]).astype(int))
+            for i in table["nucleus_id"]
+        ]
+        colorscale, showscale, cmin, cmax = None, False, None, None
+    else:
+        if color_by not in table.columns:
+            raise ValueError(
+                f"color_by must be 'z', 'n_voxels', 'n_planes' or 'random', got {color_by!r}"
+            )
+        color = table[color_by]
+        colorscale = "Viridis" if theme.is_dark else "Cividis"
+        showscale = True
+        cmin = float(np.quantile(color, 0.01))
+        cmax = float(np.quantile(color, 0.99)) or None
+
+    if size_by_voxels:
+        radius = np.cbrt(table["n_voxels"].to_numpy(dtype=float))
+        span = radius.max() - radius.min()
+        scaled = (radius - radius.min()) / span if span else np.zeros_like(radius)
+        sizes = marker_size * (0.5 + 1.5 * scaled)
+    else:
+        sizes = marker_size
+
+    custom = np.stack([
+        table["nucleus_id"], table["n_voxels"], table["n_planes"],
+        table["z_min"], table["z_max"],
+    ], axis=1)
+
+    fig = go.Figure(
+        go.Scatter3d(
+            x=table[coords[0]], y=table[coords[1]], z=table[coords[2]],
+            mode="markers",
+            marker=dict(
+                size=sizes, color=color, colorscale=colorscale,
+                cmin=cmin, cmax=cmax, opacity=0.85, line=dict(width=0),
+                showscale=showscale,
+                colorbar=dict(
+                    len=0.5, thickness=10, tickfont=dict(color=theme.font),
+                    title=dict(text=color_by, font=dict(color=theme.font)),
+                ) if showscale else None,
+            ),
+            customdata=custom,
+            hovertemplate=(
+                "id %{customdata[0]}<br>%{customdata[1]:,} voxels"
+                "<br>%{customdata[2]} z-bin(s) (%{customdata[3]}–%{customdata[4]})"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+    counted = "nuclei" if linked else "label appearances (per-plane ids)"
+    heading = title or f"{embryo_id or 'masks'} — {len(table):,} {counted}"
+    fig.update_layout(
+        template=theme.plotly_template,
+        paper_bgcolor=theme.paper,
+        font=dict(color=theme.font),
+        scene=_plotly_scene(theme, labels),
+        title=dict(
+            text=f"{heading}<br><sub>{seg_mode or 'labels'}</sub>",
+            font=dict(size=14, color=theme.font),
+        ),
+        width=width, height=height,
+        margin=dict(l=0, r=0, t=70, b=0),
+    )
+    _write_html(fig, save_path)
     return fig

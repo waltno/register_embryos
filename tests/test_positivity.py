@@ -701,3 +701,65 @@ def test_registration_report_warns_on_a_reversing_rotation(two_embryo_domains):
     report = registration_report(result, verbose=False)
     assert any("reverses anterior-posterior" in w for w in report["warnings"])
     assert list(report["rotations"]["embryo_id"]) == ["b"]
+
+
+# -- choosing which genes to draw ----------------------------------------------
+
+def test_one_gene_can_be_named_as_a_bare_string(cohort, tmp_path):
+    """`genes="wt1a"` is the obvious call; iterating a string matched nothing."""
+    from register_embryos.plotting import _resolve_genes, plot_additive_gene_2d
+
+    assert _resolve_genes(cohort, "hand2") == ["hand2"]
+    fig = plot_additive_gene_2d(cohort, genes="hand2", verbose=False,
+                                save_path=tmp_path / "one.png")
+    matplotlib.pyplot.close(fig)
+
+
+def test_a_misspelled_gene_is_an_error_not_a_blank_panel(cohort):
+    from register_embryos.plotting import _resolve_genes
+
+    with pytest.raises(ValueError, match="not in the table"):
+        _resolve_genes(cohort, ["hand2", "hand3"])
+    with pytest.raises(ValueError, match="Available"):
+        _resolve_genes(cohort, "wt1a")          # not in this cohort's panel
+
+
+def test_a_gene_keeps_its_colour_whatever_else_is_plotted():
+    """Two figures of one cohort have to be readable together."""
+    from register_embryos.plotting import gene_color
+
+    # Position-based fallbacks made this fail for genes outside GENE_RGB.
+    for gene in ("hand2", "some_new_gene", "another"):
+        assert np.allclose(gene_color(gene, 0), gene_color(gene, 4))
+
+
+def test_gene_colours_are_stable_between_processes():
+    """A salted hash would repaint every figure on restart."""
+    import subprocess
+    import sys
+
+    code = (
+        "from register_embryos.plotting import gene_color;"
+        "print(list(gene_color('some_new_gene')))"
+    )
+    runs = {
+        subprocess.run([sys.executable, "-c", code], capture_output=True,
+                       text=True, check=True).stdout.strip()
+        for _ in range(2)
+    }
+    assert len(runs) == 1
+
+
+@pytest.mark.parametrize("selection", [None, "hand2", ["hand2"], ["hand2", "tbx1"]])
+def test_every_2d_plot_takes_a_gene_selection(cohort, tmp_path, selection):
+    from register_embryos.plotting import (
+        plot_additive_2d, plot_additive_gene_2d, plot_gene_by_embryo,
+        plot_gene_panels_2d,
+    )
+
+    e0 = cohort[cohort["embryo_id"] == "e0"]          # panel is hand2 + tbx1
+    for plotter, frame in ((plot_additive_2d, e0), (plot_additive_gene_2d, e0),
+                           (plot_gene_panels_2d, e0), (plot_gene_by_embryo, e0)):
+        fig = plotter(frame, genes=selection,
+                      save_path=tmp_path / f"{plotter.__name__}.png")
+        matplotlib.pyplot.close(fig)

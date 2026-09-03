@@ -35,18 +35,38 @@ from .segmentation import SegmentedEmbryo
 
 __all__ = [
     "BACKGROUND_VALUE",
+    "FATE_ORDER",
     "EmbryoResult",
+    "PixelFate",
     "build_signal_mask",
     "assign_signal_pixels_2d",
     "assign_signal_pixels_3d",
     "nucleus_table",
     "build_nucleus_table",
     "build_cohort_tables",
+    "pixel_fate",
 ]
 
 #: Sentinel written into pixels that carry no signal.  Chosen non-zero so it is
 #: distinguishable from a genuine zero-intensity measurement.
 BACKGROUND_VALUE = 0.3
+
+#: What can happen to a pixel between the raw frame and the nucleus table, in
+#: code order.  The index into this list is the value stored in
+#: :attr:`PixelFate.fate`, so the order is part of the contract -- append, never
+#: reorder.  Codes 4 and 5 are the two ways a pixel that *has* signal is thrown
+#: away, which is what :func:`pixel_fate` exists to show.
+FATE_ORDER = [
+    "background",                    # 0: below the cut and outside every nucleus
+    "nucleus, below cut",            # 1: inside a nucleus, but not measured
+    "measured: in nucleus",          # 2: inside a nucleus and above the cut
+    "measured: assigned",            # 3: signal handed to the nearest nucleus
+    "dropped: too far",              # 4: signal beyond max_assign_distance_um
+    "dropped: no nuclei on plane",   # 5: signal on a plane Cellpose found nothing on
+]
+
+#: Convenience lookup, name -> code.
+FATE_CODES = {name: index for index, name in enumerate(FATE_ORDER)}
 
 
 @dataclass
@@ -74,6 +94,107 @@ class EmbryoResult:
         if self.nucleus_df.empty:
             return 0
         return int(self.nucleus_df["nucleus_id"].nunique())
+
+
+@dataclass
+class PixelFate:
+    """What :func:`build_nucleus_table` would do to every pixel, without doing it.
+
+    The nucleus table is a mean over surviving pixels, so the pixels it *discards*
+    never appear in any downstream figure -- a bright speck assigned across half
+    the frame and a real domain look identical once both are a number per nucleus.
+    This is the view before that reduction: one code per pixel, from
+    :data:`FATE_ORDER`.
+
+    :attr:`distances_um` holds the nucleus distance of every signal pixel outside a
+    nucleus, so :meth:`recut` can re-decide the cap without another KD-tree query.
+    That makes sweeping ``max_assign_distance_um`` cheap, which is the point -- the
+    cap is the one assignment parameter with no principled default, and it is chosen
+    by looking.
+    """
+
+    embryo_id: str
+    fate: np.ndarray                      # uint8 (Z, Y, X), values index FATE_ORDER
+    distances_um: np.ndarray              # (N,) float32, one per queried signal pixel
+    coords: np.ndarray                    # (N, 3) int16 (z, y, x), matching distances_um
+    xy_um: float = 1.0
+    z_um: float = 1.0
+    is_3d: bool = False
+    signal_threshold: float = 0.05
+    max_assign_distance_um: Optional[float] = None
+    params: Dict[str, object] = field(default_factory=dict)
+
+    @property
+    def n_pixels(self) -> int:
+        return int(self.fate.size)
+
+    @property
+    def counts(self) -> Dict[str, int]:
+        """Pixel count per fate, every category present even at zero."""
+        tallied = np.bincount(self.fate.ravel(), minlength=len(FATE_ORDER))
+        return {name: int(tallied[code]) for code, name in enumerate(FATE_ORDER)}
+
+    @property
+    def summary(self) -> pd.DataFrame:
+        """One row per fate: pixels, % of the frame, % of the signal pixels.
+
+        ``pct_of_signal`` is the column to read. ``background`` is most of any
+        frame, so a percentage of the frame makes every other category look
+        negligible whether or not it is.
+        """
+        counts = self.counts
+        signal_total = sum(
+            counts[name] for name in FATE_ORDER if name != "background"
+            and name != "nucleus, below cut"
+        )
+        rows = []
+        for name in FATE_ORDER:
+            rows.append({
+                "fate": name,
+                "n_pixels": counts[name],
+                "pct_of_frame": 100.0 * counts[name] / max(self.n_pixels, 1),
+                "pct_of_signal": (
+                    np.nan if name in ("background", "nucleus, below cut")
+                    else 100.0 * counts[name] / max(signal_total, 1)
+                ),
+            })
+        return pd.DataFrame(rows)
+
+    @property
+    def dropped_fraction(self) -> float:
+        """Fraction of signal pixels outside nuclei that the cap throws away."""
+        if self.distances_um.size == 0:
+            return 0.0
+        if self.max_assign_distance_um is None:
+            return 0.0
+        return float(
+            (self.distances_um > self.max_assign_distance_um).mean()
+        )
+
+    def recut(self, max_assign_distance_um: Optional[float]) -> "PixelFate":
+        """The same embryo under a different distance cap. No re-segmentation, no tree.
+
+        Only codes 3 and 4 can move: the threshold decided everything else, and the
+        cap cannot rescue a pixel that never had signal.
+        """
+        fate = self.fate.copy()
+        if self.coords.size:
+            z, y, x = self.coords[:, 0], self.coords[:, 1], self.coords[:, 2]
+            keep = (
+                np.ones(len(self.distances_um), dtype=bool)
+                if max_assign_distance_um is None
+                else self.distances_um <= float(max_assign_distance_um)
+            )
+            fate[z, y, x] = np.where(
+                keep, FATE_CODES["measured: assigned"], FATE_CODES["dropped: too far"]
+            )
+        return PixelFate(
+            embryo_id=self.embryo_id, fate=fate, distances_um=self.distances_um,
+            coords=self.coords, xy_um=self.xy_um, z_um=self.z_um, is_3d=self.is_3d,
+            signal_threshold=self.signal_threshold,
+            max_assign_distance_um=max_assign_distance_um,
+            params={**self.params, "max_assign_distance_um": max_assign_distance_um},
+        )
 
 
 def build_signal_mask(
@@ -311,6 +432,157 @@ def assign_signal_pixels_3d(
             + f" | median distance {np.median(distances[keep]) if keep.any() else 0:.2f} um"
         )
     return assigned
+
+
+def pixel_fate(
+    segmented: SegmentedEmbryo,
+    signal_threshold: float = 0.05,
+    max_assign_distance_um: Optional[float] = None,
+    mask_source: str = "genes",
+    nuclei_threshold: Optional[float] = None,
+    gene_volume: Optional[Dict[int, np.ndarray]] = None,
+    verbose: bool = True,
+) -> PixelFate:
+    """Classify every pixel the way :func:`build_nucleus_table` will, but keep the map.
+
+    Same threshold, same mask, same nearest-nucleus query with the same cap -- the
+    difference is that nothing is reduced to a mean, so what gets discarded stays
+    visible and can be drawn (:func:`~register_embryos.plotting.plot_pixel_fate`).
+    Run it *before* ``build_tables`` to pick ``signal_threshold`` and
+    ``max_assign_distance_um`` by looking at the consequence rather than at the
+    resulting nucleus counts, where a wrong cap is invisible.
+
+    Two of the six fates are pixels with real signal being thrown away:
+
+    ``dropped: too far``
+        Beyond ``max_assign_distance_um`` of any nucleus. This is the debris
+        defence working -- or, if a whole domain is red, the cap set too tight.
+    ``dropped: no nuclei on plane``
+        On a z-plane where Cellpose found nothing at all, so per-slice assignment
+        skips it. ``build_tables`` never mentions these; they are not in its
+        "dropped" count, they simply never enter the loop. Typically the top and
+        bottom bins of a stack, which is fine -- anywhere else it means
+        segmentation failed on that plane.
+
+    Territory is decided by the signal mask under both ``signal_mask_mode``
+    settings, so this map is exact for either. What ``"per_channel"`` changes is
+    only which *genes* a kept pixel counts for, one channel at a time; the
+    in-nucleus split here follows the union rule.
+
+    Args:
+        max_assign_distance_um: the cap to draw. ``None`` shows uncapped
+            assignment, i.e. every signal pixel reaching its nearest nucleus
+            however far away -- worth looking at once, because it is what the
+            pipeline did by default before 2026-09-01.
+        gene_volume: replacement gene-channel arrays, as in
+            :func:`build_nucleus_table`, so a re-tuned contrast can be previewed
+            without touching the masks.
+    """
+    channels = dict(segmented.adjusted_channels)
+    if gene_volume:
+        for channel, data in gene_volume.items():
+            if channel != 0:
+                channels[channel] = data
+
+    signal = build_signal_mask(
+        channels, signal_threshold=signal_threshold, source=mask_source,
+        nuclei_threshold=nuclei_threshold, verbose=verbose,
+    )
+    masks = segmented.nuclear_masks
+    if masks.shape != signal.shape:
+        raise ValueError(
+            f"masks {masks.shape} and channels {signal.shape} disagree -- the masks "
+            f"were made from a different volume (a different rotation or bin size)"
+        )
+    if max(masks.shape) > np.iinfo(np.int16).max:
+        raise ValueError(f"volume {masks.shape} too large for int16 coordinates")
+
+    binned = segmented.volume.binned_voxel
+    in_nucleus = masks > 0
+
+    fate = np.zeros(masks.shape, dtype=np.uint8)
+    fate[in_nucleus] = FATE_CODES["nucleus, below cut"]
+    fate[in_nucleus & signal] = FATE_CODES["measured: in nucleus"]
+    outside = signal & ~in_nucleus
+
+    coord_blocks: List[np.ndarray] = []
+    distance_blocks: List[np.ndarray] = []
+
+    if segmented.is_3d:
+        nucleus_indices = np.nonzero(in_nucleus)
+        query = np.column_stack(np.nonzero(outside))
+        if nucleus_indices[0].size == 0:
+            fate[outside] = FATE_CODES["dropped: no nuclei on plane"]
+        elif query.size:
+            scale = np.asarray(
+                (binned.z_um, binned.xy_um, binned.xy_um), dtype=float
+            )
+            tree = cKDTree(np.column_stack(nucleus_indices) * scale)
+            distances, _ = tree.query(query * scale)
+            coord_blocks.append(query.astype(np.int16))
+            distance_blocks.append(distances.astype(np.float32))
+    else:
+        for z in range(masks.shape[0]):
+            plane_outside = outside[z]
+            if not plane_outside.any():
+                continue
+            frame = masks[z]
+            if frame.max() <= 0:
+                # assign_signal_pixels_2d skips this plane entirely; its signal is
+                # lost without ever being counted as dropped.
+                fate[z][plane_outside] = FATE_CODES["dropped: no nuclei on plane"]
+                continue
+            nucleus_points = np.column_stack(np.nonzero(frame))
+            query = np.column_stack(np.nonzero(plane_outside))
+            distances, _ = cKDTree(nucleus_points).query(query)
+            coords = np.column_stack(
+                [np.full(len(query), z, dtype=np.int16), query.astype(np.int16)]
+            )
+            coord_blocks.append(coords)
+            distance_blocks.append((distances * binned.xy_um).astype(np.float32))
+
+    coords = (
+        np.concatenate(coord_blocks) if coord_blocks
+        else np.zeros((0, 3), dtype=np.int16)
+    )
+    distances_um = (
+        np.concatenate(distance_blocks) if distance_blocks
+        else np.zeros(0, dtype=np.float32)
+    )
+
+    result = PixelFate(
+        embryo_id=segmented.embryo_id, fate=fate, distances_um=distances_um,
+        coords=coords, xy_um=binned.xy_um, z_um=binned.z_um,
+        is_3d=segmented.is_3d, signal_threshold=signal_threshold,
+        max_assign_distance_um=None,
+        params={
+            "signal_threshold": signal_threshold,
+            "mask_source": mask_source,
+            "nuclei_threshold": nuclei_threshold,
+            "mode": segmented.mode,
+        },
+    ).recut(max_assign_distance_um)
+
+    if verbose:
+        counts = result.counts
+        cap = (
+            "uncapped" if max_assign_distance_um is None
+            else f"cap {max_assign_distance_um} um"
+        )
+        print(
+            f"  [FATE] {segmented.embryo_id} ({cap}): "
+            f"{counts['measured: assigned']:,} assigned, "
+            f"{counts['dropped: too far']:,} too far, "
+            f"{counts['dropped: no nuclei on plane']:,} on planes with no nuclei"
+        )
+        blank = counts["dropped: no nuclei on plane"]
+        if blank and blank > 0.02 * max(int(outside.sum()), 1):
+            print(
+                f"  [WARN] {100 * blank / max(int(outside.sum()), 1):.1f}% of signal "
+                f"outside nuclei sits on planes Cellpose found no nuclei on -- check "
+                f"the fate map before treating that as empty stack"
+            )
+    return result
 
 
 def nucleus_table(

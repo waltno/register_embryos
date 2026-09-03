@@ -29,7 +29,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-from .assignment import EmbryoResult, build_cohort_tables
+from .assignment import EmbryoResult, PixelFate, build_cohort_tables
 from .atlas import Atlas, atlas_diagnostics, build_atlas
 from .contrast import (
     ContrastLimits,
@@ -289,10 +289,21 @@ class CohortWorkflow:
         gpu: bool = False,
         diameter: Optional[float] = None,
         max_workers: int = 1,
+        channel: int = 0,
         verbose: bool = True,
         **kwargs,
     ) -> List[SegmentedEmbryo]:
-        """Cellpose nuclear segmentation. The slow second step."""
+        """Cellpose nuclear segmentation. The slow second step.
+
+        Args:
+            channel: which channel Cellpose segments. 0 is the nuclear stain and
+                is the right answer nearly always. Point it at a gene channel
+                only to test what that stain alone segments into -- the rest of
+                the pipeline still calls channel 0 "nuclei" and channels 1+
+                "genes", so the segmented channel is then also measured as a
+                gene against its own masks, and the resulting table's per-nucleus
+                means for it are not comparable with a channel-0 run.
+        """
         volumes = self.adjusted or self.volumes
         if not volumes:
             raise RuntimeError("call load() (and usually apply_prep()) first")
@@ -304,13 +315,24 @@ class CohortWorkflow:
                 f"with bin_size={volumes[0].bin_size}. Re-run load(bin_size=1) "
                 f"(and apply_prep again), or segment with mode='2d' / '2d+link'."
             )
+        if channel != 0:
+            gene = volumes[0].gene_map.get(channel, f"ch{channel}")
+            print(
+                f"  [NOTE] segmenting channel {channel} ({gene}), not the nuclear "
+                f"channel 0. Masks describe that stain, and downstream steps still "
+                f"treat channel 0 as nuclei."
+            )
 
         print(f"\n{'='*72}\nSEGMENT ({mode}) — {self.cohort.name}\n{'='*72}")
         self.segmented = segment_cohort(
             volumes, output_root=self.output_dir / "embryos", mode=mode, gpu=gpu,
-            diameter=diameter, max_workers=max_workers, verbose=verbose, **kwargs,
+            diameter=diameter, nuclei_channel=channel, max_workers=max_workers,
+            verbose=verbose, **kwargs,
         )
-        self._params.update({"segmentation_mode": mode, "diameter": diameter})
+        self._params.update(
+            {"segmentation_mode": mode, "diameter": diameter,
+             "segmentation_channel": channel}
+        )
         return self.segmented
 
     def reload_segmentation(
@@ -522,6 +544,99 @@ class CohortWorkflow:
                           f"-> {moved['mean_after'].mean():.2f} px "
                           f"(cohort mean, reference excluded)")
         return self.registration
+
+    def view_masks(self, embryo_ids: Optional[Sequence[str]] = None, **kwargs):
+        """Open the z-by-z mask viewer for this cohort's segmentation.
+
+        Needs only ``segment()`` or ``reload_segmentation()`` -- no tables, so
+        this is the first look at what Cellpose produced, before any threshold or
+        assignment cap has been chosen.  See
+        :func:`~register_embryos.widgets.segmentation_widget`; the saveable
+        version is :func:`~register_embryos.plotting.plot_mask_planes`.
+        """
+        from .widgets import segmentation_widget
+
+        if not self.segmented:
+            raise RuntimeError("call segment() or reload_segmentation() first")
+        wanted = set(embryo_ids) if embryo_ids is not None else None
+        chosen = [
+            embryo for embryo in self.segmented
+            if wanted is None or embryo.embryo_id in wanted
+        ]
+        if not chosen:
+            raise ValueError(
+                f"no segmented embryo matches {sorted(wanted)}; have "
+                f"{[embryo.embryo_id for embryo in self.segmented]}"
+            )
+        return segmentation_widget(chosen, **kwargs)
+
+    def preview_assignment(
+        self,
+        signal_threshold: float = 0.05,
+        max_assign_distance_um: Optional[float] = None,
+        embryo_ids: Optional[Sequence[str]] = None,
+        mask_source: str = "genes",
+        nuclei_threshold: Optional[float] = None,
+        plot: bool = True,
+        modes: Sequence[str] = ("light",),
+        save_dir: Optional[Path] = None,
+        verbose: bool = True,
+        **plot_kwargs,
+    ) -> Dict[str, "PixelFate"]:
+        """What ``build_tables`` would discard, per pixel, without building anything.
+
+        The dry run for the two parameters that decide the measurement.
+        ``signal_threshold`` and ``max_assign_distance_um`` are invisible in their
+        own output -- a nucleus table built with a cap ten times too tight still
+        has one row per nucleus and a plausible number in every column -- so they
+        have to be judged on the pixels, before the mean.
+
+        Returns ``{embryo_id: PixelFate}``.  Re-cutting the distance is free from
+        there (``fate.recut(30.0)``); only a new ``signal_threshold`` needs this
+        called again.
+
+        Args:
+            embryo_ids: default is every segmented embryo.  Pass one to iterate
+                quickly, then confirm across the cohort.
+            save_dir: default ``<run dir>/qc``, since this is run QC and not a
+                curated figure.
+        """
+        from .assignment import pixel_fate
+        from .plotting import plot_pixel_fate
+
+        if not self.segmented:
+            raise RuntimeError("call segment() or reload_segmentation() first")
+        wanted = set(embryo_ids) if embryo_ids is not None else None
+        chosen = [
+            embryo for embryo in self.segmented
+            if wanted is None or embryo.embryo_id in wanted
+        ]
+        if not chosen:
+            raise ValueError(
+                f"no segmented embryo matches {sorted(wanted)}; have "
+                f"{[embryo.embryo_id for embryo in self.segmented]}"
+            )
+        if verbose:
+            print(f"\n{'='*72}\nASSIGNMENT PREVIEW — {self.cohort.name}\n{'='*72}")
+
+        directory = Path(save_dir) if save_dir is not None else self.output_dir / "qc"
+        fates: Dict[str, "PixelFate"] = {}
+        for embryo in chosen:
+            fate = pixel_fate(
+                embryo, signal_threshold=signal_threshold,
+                max_assign_distance_um=max_assign_distance_um,
+                mask_source=mask_source, nuclei_threshold=nuclei_threshold,
+                verbose=verbose,
+            )
+            fates[embryo.embryo_id] = fate
+            if plot:
+                for mode in modes:
+                    plot_pixel_fate(
+                        fate, mode=mode,
+                        save_path=directory / f"{embryo.embryo_id}_pixel_fate_{mode}.png",
+                        **plot_kwargs,
+                    )
+        return fates
 
     def build_tables(
         self,
