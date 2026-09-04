@@ -35,8 +35,17 @@ dependencies = [
 widgets = ["ipywidgets>=8.0", "ipython>=8.0"]
 open3d = ["open3d>=0.17"]
 gmm = ["scikit-learn>=1.0"]
+# torch is already pulled in transitively by cellpose; geomloss is the only
+# genuinely new dependency for register_points(method="rot")'s default
+# backend="geomloss" (registration.robot_refine). Optional, like open3d --
+# without it, robot_refine(backend="auto") falls back to a NumPy engine
+# (registration.HAS_TORCH_GEOMLOSS).
+robot_ot = ["torch>=2.0", "geomloss>=0.3"]
 dev = ["pytest>=7.0", "pytest-cov>=4.0"]
-all = ["ipywidgets>=8.0", "ipython>=8.0", "open3d>=0.17", "scikit-learn>=1.0", "pytest>=7.0"]
+all = [
+  "ipywidgets>=8.0", "ipython>=8.0", "open3d>=0.17", "scikit-learn>=1.0",
+  "pytest>=7.0", "geomloss>=0.3",
+]
 
 [project.scripts]
 register-embryos = "register_embryos.cli:app"

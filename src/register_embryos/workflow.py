@@ -689,16 +689,27 @@ class CohortWorkflow:
         n_downsample: Optional[int] = 5000,
         trust_orientation: Optional[bool] = None,
         max_rotation_deg: float = 30.0,
+        method: str = "icp",
+        rot_kwargs: Optional[Dict[str, object]] = None,
         verbose: bool = True,
         **icp_kwargs,
     ) -> RegistrationResult:
-        """Point-to-point ICP of every embryo onto one reference.
+        """Register every embryo onto one reference: ICP, or robust optimal transport.
 
         Args:
+            method: ``"icp"`` (default, unchanged) -- point-to-point ICP.
+                ``"rot"`` -- iterated robust optimal transport
+                (:func:`~register_embryos.registration.robot_refine`), a
+                from-scratch registration rather than a refinement of an ICP
+                fit. ``**icp_kwargs`` is only used by ``method="icp"``; pass
+                ``rot_kwargs`` for ``method="rot"``. See
+                :func:`~register_embryos.registration.register_frames` for the
+                full contract.
             trust_orientation: treat the rotation set in the widget as correct and
-                let ICP only refine it -- no PCA re-derivation, rotation about z
-                only, capped at ``max_rotation_deg``. Defaults to True whenever
-                orientations were recorded for this cohort.
+                let registration only refine it -- no PCA re-derivation (ICP) /
+                unconstrained search (RobOT), rotation about z only, capped at
+                ``max_rotation_deg``. Defaults to True whenever orientations were
+                recorded for this cohort.
 
                 This default exists because the unconstrained fit is actively wrong
                 here: a 12-somite dorsal nucleus cloud is nearly a disc of
@@ -707,20 +718,31 @@ class CohortWorkflow:
                 well as a correct one. Anterior-posterior orientation is obvious in
                 the image and was already set from it; re-deriving it from the cloud
                 throws that away.
-            max_rotation_deg: the largest in-plane correction ICP may apply when
-                ``trust_orientation``.
+            max_rotation_deg: the largest in-plane correction registration may
+                apply when ``trust_orientation``.
+            rot_kwargs: forwarded to ``robot_refine`` when ``method="rot"``.
+                ``trust_orientation`` sets ``inplane_only``/``max_rotation_deg``
+                in here too, the same way it sets them in ``icp_kwargs`` for
+                ``method="icp"``.
         """
         if self.combined.empty:
             raise RuntimeError("call build_tables() first")
+        if method not in ("icp", "rot"):
+            raise ValueError(f"method must be 'icp' or 'rot', got {method!r}")
 
         if trust_orientation is None:
             trust_orientation = len(self.orientations) > 0
+        rot_kwargs = dict(rot_kwargs or {})
         if trust_orientation:
-            icp_kwargs.setdefault("pca_init", False)
-            icp_kwargs.setdefault("inplane_only", True)
-            icp_kwargs.setdefault("max_rotation_deg", max_rotation_deg)
+            if method == "icp":
+                icp_kwargs.setdefault("pca_init", False)
+                icp_kwargs.setdefault("inplane_only", True)
+                icp_kwargs.setdefault("max_rotation_deg", max_rotation_deg)
+            else:
+                rot_kwargs.setdefault("inplane_only", True)
+                rot_kwargs.setdefault("max_rotation_deg", max_rotation_deg)
 
-        print(f"\n{'='*72}\nREGISTER — {self.cohort.name}\n{'='*72}")
+        print(f"\n{'='*72}\nREGISTER — {self.cohort.name} ({method})\n{'='*72}")
         if trust_orientation:
             print(f"  trusting the manual orientation: no PCA re-derivation, "
                   f"in-plane only, capped at +/-{max_rotation_deg:g} deg")
@@ -739,6 +761,8 @@ class CohortWorkflow:
             reference_embryo_id=reference_embryo_id,
             n_downsample=n_downsample,
             output_root=self.output_dir,
+            method=method,
+            rot_kwargs=rot_kwargs,
             verbose=verbose,
             **icp_kwargs,
         )

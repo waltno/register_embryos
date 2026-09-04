@@ -132,6 +132,7 @@ from .registration import (
     rotation_angles,
     RegistrationResult,
     icp_point_to_point,
+    register_points,
     gene_domain_agreement,
     icp_residuals,
     isotropic_downsample,
@@ -205,7 +206,8 @@ __all__ = [
     "HAS_OPEN3D", "RegistrationResult", "isotropic_downsample", "pca_align",
     "rotation_angles", "sinkhorn_plan", "ot_refine",
     "unbalanced_sinkhorn_potentials", "robot_refine",
-    "icp_point_to_point", "icp_residuals", "register_cohort", "register_frames",
+    "icp_point_to_point", "register_points", "icp_residuals",
+    "register_cohort", "register_frames",
     # atlas
     "Atlas", "build_atlas", "atlas_diagnostics", "align_atlases",
     # thresholds

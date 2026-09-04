@@ -1185,7 +1185,11 @@ def test_ot_refine_respects_the_rotation_cap():
     assert tilt == pytest.approx(0.0, abs=1e-6)
 
 
-def test_register_frames_can_run_the_ot_stage():
+def test_register_frames_rejects_removed_ot_refine_kwargs():
+    """refine_with_ot/ot_max_rotation_deg/ot_kwargs were removed outright (not
+    deprecated) in favour of method='icp'|'rot'; a caller still using them
+    should get a hard TypeError, not a silent no-op. Needs a non-reference
+    embryo, or the (now-unrecognised) kwarg never reaches icp_point_to_point."""
     from register_embryos.registration import register_frames
 
     target = _disc_cloud(seed=9)
@@ -1194,13 +1198,9 @@ def test_register_frames_can_run_the_ot_stage():
         "ref": pd.DataFrame(target, columns=["x", "y", "z"]).assign(embryo_id="ref"),
         "mov": pd.DataFrame(source, columns=["x", "y", "z"]).assign(embryo_id="mov"),
     }
-    plain = register_frames(frames, reference_embryo_id="ref", n_downsample=None,
-                            pca_init=False, verbose=False)
-    with_ot = register_frames(frames, reference_embryo_id="ref", n_downsample=None,
-                              pca_init=False, refine_with_ot=True,
-                              ot_kwargs={"max_points": 400}, verbose=False)
-    assert not np.allclose(with_ot.transform_of("mov"), plain.transform_of("mov"))
-    assert with_ot.stats["mean_after"].iloc[0] < with_ot.stats["mean_before"].iloc[0]
+    with pytest.raises(TypeError):
+        register_frames(frames, reference_embryo_id="ref", n_downsample=None,
+                         refine_with_ot=True, verbose=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1677,6 +1677,48 @@ def test_reach_lets_unmatched_mass_be_dropped():
     assert robust[:-1].mean() > 5 * robust[-1]             # inliers keep theirs
 
 
+def test_robot_refine_rejects_unknown_backend():
+    from register_embryos.registration import robot_refine
+
+    with pytest.raises(ValueError):
+        robot_refine(_shell(n=50, seed=0), _shell(n=50, seed=1), backend="not-a-backend")
+
+
+def test_robot_refine_geomloss_backend_requires_the_dependency(monkeypatch):
+    """backend='geomloss' is a hard requirement, not a silent fallback -- the
+    whole point of a named backend is that you get what you asked for."""
+    from register_embryos import registration as reg_module
+
+    monkeypatch.setattr(reg_module, "HAS_TORCH_GEOMLOSS", False)
+    with pytest.raises(ImportError):
+        reg_module.robot_refine(
+            _shell(n=50, seed=0), _shell(n=50, seed=1), backend="geomloss"
+        )
+
+
+@pytest.mark.skipif(
+    not __import__("register_embryos.registration", fromlist=["HAS_TORCH_GEOMLOSS"]).HAS_TORCH_GEOMLOSS,
+    reason="torch/geomloss not installed",
+)
+def test_robot_refine_numpy_and_geomloss_backends_agree():
+    """Both engines solve the same objective; they should land close together,
+    not just each pass its own tolerance-tuned assertions independently."""
+    from scipy.spatial import cKDTree
+
+    from register_embryos.registration import robot_refine
+
+    target = _shell(n=500, seed=6)
+    source = target @ _rotation_z(15.0).T + np.array([6.0, -4.0, 1.0])
+
+    _, numpy_transform = robot_refine(source, target, n_outer=6, backend="numpy", verbose=False)
+    _, geomloss_transform = robot_refine(source, target, n_outer=6, backend="geomloss", verbose=False)
+
+    numpy_residual = float(cKDTree(target).query(_apply(source, numpy_transform))[0].mean())
+    geomloss_residual = float(cKDTree(target).query(_apply(source, geomloss_transform))[0].mean())
+    assert numpy_residual < 0.5
+    assert geomloss_residual < 0.5
+
+
 def test_robot_recovers_a_known_rigid_transform():
     from scipy.spatial import cKDTree
 
@@ -1761,22 +1803,68 @@ def test_robot_honours_a_rotation_cap_when_asked():
     assert rotation_angles(capped)[1] == pytest.approx(0.0, abs=1e-6)  # in-plane only
 
 
-def test_ot_kwargs_can_override_the_constraint(tmp_path):
-    """Regression: register_frames passed inplane_only both explicitly and via
-    ot_kwargs, so the documented way to unconstrain the OT stage raised TypeError.
-    """
+def test_register_points_dispatches_icp_and_rot():
+    """register_points(..., method=) is register_embryos' single pairwise entry
+    point: 'icp' goes to icp_point_to_point, 'rot' to robot_refine, and an
+    unknown method is rejected rather than silently falling back to one."""
+    from register_embryos.registration import (
+        icp_point_to_point, register_points, robot_refine,
+    )
+
+    target = _shell(n=400, seed=7)
+    source = target @ _rotation_z(8.0).T + np.array([5.0, -3.0, 0.0])
+
+    icp_transformed, icp_transform = icp_point_to_point(source, target)
+    dispatched_icp, dispatched_icp_transform = register_points(
+        source, target, method="icp"
+    )
+    assert np.allclose(dispatched_icp, icp_transformed)
+    assert np.allclose(dispatched_icp_transform, icp_transform)
+
+    rot_transformed, rot_transform = robot_refine(
+        source, target, n_outer=6, verbose=False
+    )
+    dispatched_rot, dispatched_rot_transform = register_points(
+        source, target, method="rot", n_outer=6, verbose=False
+    )
+    assert np.allclose(dispatched_rot, rot_transformed)
+    assert np.allclose(dispatched_rot_transform, rot_transform)
+
+    with pytest.raises(ValueError):
+        register_points(source, target, method="not-a-method")
+
+
+def test_register_frames_method_rot_registers_without_icp():
+    """method='rot' is the primary registration, not a post-ICP refinement --
+    the transform it returns should not equal an identity-composed ICP-less
+    passthrough, and the residual should improve just like method='icp' does."""
     from register_embryos.registration import register_frames
 
-    rng = np.random.default_rng(5)
-    frames = {}
-    for i, name in enumerate(["a", "b"]):
-        cloud = _shell(n=300, seed=i)
-        frames[name] = pd.DataFrame(cloud, columns=["x", "y", "z"]).assign(
-            embryo_id=name, nucleus_id=np.arange(len(cloud)),
-        )
+    target = _disc_cloud(seed=11)
+    source = _apply(target, _z_rotation(15.0)) + np.array([20.0, -8.0, 0.5])
+    frames = {
+        "ref": pd.DataFrame(target, columns=["x", "y", "z"]).assign(embryo_id="ref"),
+        "mov": pd.DataFrame(source, columns=["x", "y", "z"]).assign(embryo_id="mov"),
+    }
+
     result = register_frames(
-        frames, reference_embryo_id="a", refine_with_ot=True,
-        ot_kwargs={"inplane_only": False, "max_rotation_deg": None},
-        verbose=False,
+        frames, reference_embryo_id="ref", n_downsample=None,
+        method="rot", rot_kwargs={"n_outer": 6}, verbose=False,
     )
     assert not result.registered.empty
+    assert not np.allclose(result.transform_of("mov"), np.eye(4))
+    assert result.stats["mean_after"].iloc[0] < result.stats["mean_before"].iloc[0]
+
+
+def test_register_frames_rejects_unknown_method():
+    from register_embryos.registration import register_frames
+
+    frames = {
+        "ref": pd.DataFrame(_disc_cloud(seed=1), columns=["x", "y", "z"]).assign(
+            embryo_id="ref"
+        ),
+    }
+    with pytest.raises(ValueError):
+        register_frames(frames, method="not-a-method", verbose=False)
+
+

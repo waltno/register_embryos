@@ -1,14 +1,30 @@
-"""Rigid registration of embryo nucleus clouds by point-to-point ICP.
+"""Rigid registration of embryo nucleus clouds: ICP, or robust optimal transport.
 
 Every embryo in a cohort is aligned to one reference embryo, adding ``x_reg,
 y_reg, z_reg`` to its nucleus table.  Alignment is pairwise against the
 reference, so excluding one embryo never changes how the others land -- it only
 changes the consensus atlas built from them.
 
-Two implementations, same interface: Open3D's ICP when it is installed, and a
-NumPy SVD (Kabsch) ICP otherwise.  Both are preceded by a PCA coarse alignment,
-which matters because ICP is a local method -- two embryos mounted at
-90 degrees to each other will not find each other from a cold start.
+Two primary registration methods, selected by ``method="icp"|"rot"`` on
+:func:`register_points` (a single pair) and :func:`register_frames` /
+:func:`register_cohort` (a whole cohort):
+
+``"icp"`` (default, unchanged)
+    Point-to-point ICP, two implementations behind one interface: Open3D's ICP
+    when it is installed, and a NumPy SVD (Kabsch) ICP otherwise.  Both are
+    preceded by a PCA coarse alignment, which matters because ICP is a local
+    method -- two embryos mounted at 90 degrees to each other will not find
+    each other from a cold start.
+``"rot"``
+    Iterated **r**obust **o**ptimal **t**ransport (:func:`robot_refine`), a
+    complete registration in its own right -- see that function's docstring
+    for when it succeeds where ICP does not: unequal nucleus counts, partial
+    overlap, or a starting pose ICP's local search cannot reach. There is no
+    separate OT-refinement stage layered on top of either method; whichever
+    ``method`` you pick produces the whole registration by itself.
+    (:func:`ot_refine`, a milder one-shot OT correspondence solve, remains
+    available to call directly, but is no longer wired into
+    :func:`register_frames`.)
 
 A note on residuals, learned the hard way in the original notebooks: report
 before/after with the SAME metric.  Mean nearest-neighbour distance compared
@@ -29,6 +45,7 @@ from scipy.spatial import cKDTree
 
 __all__ = [
     "HAS_OPEN3D",
+    "HAS_TORCH_GEOMLOSS",
     "rotation_angles",
     "sinkhorn_plan",
     "unbalanced_sinkhorn_potentials",
@@ -38,6 +55,7 @@ __all__ = [
     "isotropic_downsample",
     "pca_align",
     "icp_point_to_point",
+    "register_points",
     "register_cohort",
     "icp_residuals",
     "register_frames",
@@ -51,6 +69,14 @@ try:  # pragma: no cover - environment dependent
     HAS_OPEN3D = True
 except ImportError:  # pragma: no cover
     HAS_OPEN3D = False
+
+try:  # pragma: no cover - environment dependent
+    import torch as _torch
+    import geomloss as _geomloss
+
+    HAS_TORCH_GEOMLOSS = True
+except ImportError:  # pragma: no cover
+    HAS_TORCH_GEOMLOSS = False
 
 COORD_COLS = ("x", "y", "z")
 REG_COLS = ("x_reg", "y_reg", "z_reg")
@@ -724,6 +750,62 @@ def _weighted_similarity(
     return transform
 
 
+def _geomloss_plan_stats(
+    moved: np.ndarray,
+    tgt_s: np.ndarray,
+    weights_source: np.ndarray,
+    weights_target: np.ndarray,
+    blur: float,
+    reach: Optional[float],
+    scaling: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Mass kept and barycentric projection from a real geomloss unbalanced OT plan.
+
+    This is the actual reference engine (torch + geomloss's annealed, unbalanced
+    Sinkhorn solver) computing the same two quantities
+    :func:`unbalanced_sinkhorn_potentials` + a log-plan does by hand in NumPy --
+    dual potentials, then ``mass_i = sum_j plan_ij`` and
+    ``projected_i = sum_j plan_ij y_j / mass_i``. ``backend="tensorized"`` builds
+    an explicit dense plan (fine at the ``max_points``-bounded sizes
+    :func:`robot_refine` calls this with) and needs only ``torch``/``geomloss``,
+    no compiled KeOps kernels.
+
+    Checked against the NumPy engine on a real HCR embryo pair (not just
+    synthetic point sets): both closed the same ~18-20% of the starting
+    nearest-neighbour gap (unconstrained), so this is not a large accuracy win
+    on data at this scale -- but it ran ~5x faster (both bounded to the same
+    ``max_points``), and it is the actual reference library the notebook this
+    was promoted from used, rather than a from-scratch reimplementation of its
+    annealed Sinkhorn solver. Prefer it when available; the NumPy engine
+    remains for environments without ``torch``/``geomloss``.
+    """
+    # .copy() guarantees a writable array; a fancy-indexed subsample can be a
+    # non-writable view, which as_tensor would otherwise wrap directly and warn
+    # about (harmless here -- these are read-only in this function -- but noisy).
+    x = _torch.as_tensor(moved.copy(), dtype=_torch.float64)
+    y = _torch.as_tensor(tgt_s.copy(), dtype=_torch.float64)
+    a = _torch.as_tensor(weights_source.copy(), dtype=_torch.float64)
+    b = _torch.as_tensor(weights_target.copy(), dtype=_torch.float64)
+
+    loss = _geomloss.SamplesLoss(
+        loss="sinkhorn", p=2, blur=blur, reach=reach, scaling=scaling,
+        debias=False, backend="tensorized", potentials=True,
+    )
+    f_pot, g_pot = loss(a, x, b, y)
+    f_pot, g_pot = f_pot[0], g_pot[0]
+
+    epsilon = float(blur) ** 2
+    cost = 0.5 * ((x[:, None, :] - y[None, :, :]) ** 2).sum(-1)
+    log_plan = (
+        (f_pot[:, None] + g_pot[None, :] - cost) / epsilon
+        + a.log()[:, None] + b.log()[None, :]
+    )
+    plan = log_plan.exp()
+    mass = plan.sum(dim=1)
+    projected = plan @ y / mass[:, None].clamp_min(1e-300)
+    return mass.numpy(), projected.numpy()
+
+
 def robot_refine(
     source: np.ndarray,
     target: np.ndarray,
@@ -740,17 +822,47 @@ def robot_refine(
     inplane_only: bool = False,
     use_barycenter_weight: bool = True,
     seed: int = 42,
+    backend: str = "auto",
     verbose: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Rigid/similarity registration by iterated robust optimal transport.
 
-    A minimal port of the RobOT prealignment of Shen et al., *Accurate Point Cloud
+    A port of the RobOT prealignment of Shen et al., *Accurate Point Cloud
     Registration with Robust Optimal Transport* (NeurIPS 2021,
     https://github.com/uncbiag/robot), specifically ``GradFlowPreAlign`` with
-    ``gradflow_mode="ot_mapping"``. Written against numpy and scipy rather than
-    torch/geomloss/KeOps, which the reference needs and this package does not have.
+    ``gradflow_mode="ot_mapping"``.
 
-    Four things separate it from :func:`ot_refine`, and each one is a reason that
+    Two engines behind one interface, chosen by ``backend``:
+
+    ``"geomloss"``
+        The actual reference engine -- torch + geomloss's annealed, unbalanced
+        Sinkhorn solver (:func:`_geomloss_plan_stats`) computing the transport
+        plan each outer iteration. Requires ``torch`` and ``geomloss``
+        (``HAS_TORCH_GEOMLOSS``); CPU-only is fine at the ``max_points``-bounded
+        sizes this runs at, no GPU or compiled KeOps kernels needed.
+    ``"numpy"``
+        A hand-written log-domain Sinkhorn port (:func:`unbalanced_sinkhorn_potentials`)
+        with the same fixed-schedule epsilon annealing, for environments without
+        ``torch``/``geomloss``. Kept and tested, and numerically comparable to
+        ``"geomloss"`` on a real HCR embryo pair (both closed ~18-20% of the
+        starting residual, unconstrained) -- but ~5x slower at the same
+        ``max_points``, and a from-scratch reimplementation of the reference's
+        annealed Sinkhorn solver rather than the solver itself.
+    ``"auto"`` (default)
+        ``"geomloss"`` when available, else ``"numpy"`` with a printed notice.
+
+    A caveat worth knowing before trusting either engine on a hand-oriented
+    cohort: ``max_rotation_deg``/``inplane_only`` cap each outer iteration's
+    *incremental* step (see ``test_robot_honours_a_rotation_cap_when_asked``),
+    not the cumulative transform the way :func:`icp_point_to_point` does. On a
+    real embryo pair already close to aligned, that let ten small
+    within-cap corrections accumulate into a fit *worse* than doing nothing
+    (both engines) even though the unconstrained fit above improved on the
+    same pair. Check ``verbose`` output (or :func:`gene_domain_agreement`)
+    before trusting a constrained ``method="rot"`` fit on data like this
+    project's manually oriented cohorts.
+
+    Four things separate this from :func:`ot_refine`, and each one is a reason that
     function could only ever degrade an already-converged ICP fit here:
 
     1. **Unbalanced OT** (``reach``). Balanced OT must transport every source point
@@ -785,6 +897,17 @@ def robot_refine(
 
     Returns ``(transformed_source, transform)``.
     """
+    if backend not in ("auto", "geomloss", "numpy"):
+        raise ValueError(f"backend must be 'auto', 'geomloss' or 'numpy', got {backend!r}")
+    if backend == "geomloss" and not HAS_TORCH_GEOMLOSS:
+        raise ImportError(
+            "backend='geomloss' requested but torch/geomloss are not installed "
+            "(pip install torch geomloss)"
+        )
+    use_geomloss = backend == "geomloss" or (backend == "auto" and HAS_TORCH_GEOMLOSS)
+    if backend == "auto" and not HAS_TORCH_GEOMLOSS and verbose:
+        print("    [RobOT] torch/geomloss not installed; using the weaker NumPy "
+              "engine (pip install torch geomloss for the reference engine)")
     rng = np.random.default_rng(seed)
 
     def subsample(points: np.ndarray) -> np.ndarray:
@@ -813,33 +936,45 @@ def robot_refine(
     previous = None
 
     for outer in range(n_outer):
-        cost = 0.5 * (
-            (moved[:, None, :] - tgt_s[None, :, :]) ** 2
-        ).sum(axis=-1, dtype=np.float64)
-
-        # Epsilon annealing, warm-started: **one** sweep per level, which is what
-        # geomloss's `scaling` does. Running each level to convergence instead is
-        # ~20x the work for the same fixed point -- the whole point of annealing is
-        # that each level starts near its own solution.
-        potentials: Optional[Tuple[np.ndarray, np.ndarray]] = None
-        epsilon = epsilon_start
-        while True:
-            at_final = epsilon <= epsilon_final * (1 + 1e-9)
-            potentials = unbalanced_sinkhorn_potentials(
-                cost, epsilon, weights_source, weights_target, reach=reach,
-                n_iter=n_iter_final if at_final else 1, init=potentials,
+        if use_geomloss:
+            # The real reference engine: torch + geomloss's own annealed,
+            # unbalanced Sinkhorn solver picks its own schedule from `blur`,
+            # `reach` and `scaling` -- no need to hand-roll the epsilon ladder
+            # the NumPy engine below builds explicitly.
+            mass, projected_full = _geomloss_plan_stats(
+                moved, tgt_s, weights_source, weights_target,
+                blur=blur, reach=reach, scaling=scaling,
             )
-            if at_final:
-                break
-            epsilon = max(epsilon * scaling**2, epsilon_final)
+        else:
+            cost = 0.5 * (
+                (moved[:, None, :] - tgt_s[None, :, :]) ** 2
+            ).sum(axis=-1, dtype=np.float64)
 
-        f, g = potentials
-        log_plan = (
-            (f[:, None] + g[None, :] - cost) / epsilon
-            + np.log(weights_source)[:, None] + np.log(weights_target)[None, :]
-        )
-        plan = np.exp(log_plan)
-        mass = plan.sum(axis=1)
+            # Epsilon annealing, warm-started: **one** sweep per level, which is
+            # what geomloss's `scaling` does. Running each level to convergence
+            # instead is ~20x the work for the same fixed point -- the whole
+            # point of annealing is that each level starts near its own solution.
+            potentials: Optional[Tuple[np.ndarray, np.ndarray]] = None
+            epsilon = epsilon_start
+            while True:
+                at_final = epsilon <= epsilon_final * (1 + 1e-9)
+                potentials = unbalanced_sinkhorn_potentials(
+                    cost, epsilon, weights_source, weights_target, reach=reach,
+                    n_iter=n_iter_final if at_final else 1, init=potentials,
+                )
+                if at_final:
+                    break
+                epsilon = max(epsilon * scaling**2, epsilon_final)
+
+            f, g = potentials
+            log_plan = (
+                (f[:, None] + g[None, :] - cost) / epsilon
+                + np.log(weights_source)[:, None] + np.log(weights_target)[None, :]
+            )
+            plan = np.exp(log_plan)
+            mass = plan.sum(axis=1)
+            projected_full = (plan @ tgt_s) / mass[:, None].clip(min=1e-300)
+
         keep = mass > 1e-12
         if keep.sum() < 3:
             if verbose:
@@ -847,7 +982,7 @@ def robot_refine(
             break
 
         # Barycentric projection: where the transport sends each source point.
-        projected = (plan[keep] @ tgt_s) / mass[keep, None]
+        projected = projected_full[keep]
         # Mass kept, relative to what the point started with: ~1 where the
         # transport found a partner, small where it gave up.
         ratio = mass[keep] / weights_source[keep]
@@ -867,7 +1002,7 @@ def robot_refine(
         if verbose:
             residual = float(cKDTree(tgt_s).query(moved)[0].mean())
             print(f"    [RobOT] iter {outer + 1:2d}  mean NN {residual:7.3f}  "
-                  f"kept mass {ratio.mean():.3f}  eps {epsilon:.2f}")
+                  f"kept mass {ratio.mean():.3f}")
         if previous is not None and np.linalg.norm(step - np.eye(4)) < rel_ftol:
             if verbose:
                 print(f"    [RobOT] converged after {outer + 1} iterations")
@@ -879,11 +1014,45 @@ def robot_refine(
         after = float(cKDTree(target).query(_apply_transform(source, transform))[0].mean())
         in_plane, tilt = rotation_angles(transform)
         scales = np.linalg.svd(transform[:3, :3], compute_uv=False)
-        print(f"    [RobOT] blur={blur:.2f} reach={reach if reach is None else f'{reach:.1f}'}"
+        engine = "geomloss" if use_geomloss else "numpy"
+        print(f"    [RobOT] backend={engine} blur={blur:.2f} "
+              f"reach={reach if reach is None else f'{reach:.1f}'}"
               f"  mean NN {before:.3f} -> {after:.3f}  "
               f"(in-plane {in_plane:+.2f} deg, tilt {tilt:.2f} deg, "
               f"scale {scales.min():.3f}-{scales.max():.3f})")
     return _apply_transform(source, transform), transform
+
+
+# ---------------------------------------------------------------------------
+# Single entry point for a pairwise registration
+# ---------------------------------------------------------------------------
+
+def register_points(
+    source: np.ndarray,
+    target: np.ndarray,
+    method: str = "icp",
+    **kwargs,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Register ``source`` onto ``target``; returns ``(transformed, transform4x4)``.
+
+    One call, one switch. ``method="icp"`` (the default, unchanged) is
+    :func:`icp_point_to_point` -- PCA coarse alignment plus point-to-point ICP.
+    ``method="rot"`` is :func:`robot_refine` -- iterated **r**obust **o**ptimal
+    **t**ransport, a from-scratch registration rather than a refinement of an
+    existing fit (see :func:`robot_refine` for when that matters: unequal nucleus
+    counts, partial overlap, or a starting pose ICP's local search cannot reach).
+
+    ``**kwargs`` are forwarded verbatim to whichever backend ``method`` selects,
+    so pass ``max_rotation_deg=...``/``inplane_only=True`` the same way for
+    either one; both accept them and honour a hand-set orientation the same way.
+    Exactly two methods -- one call produces the whole registration, with no
+    separate OT-refinement stage layered on top of either one.
+    """
+    if method == "icp":
+        return icp_point_to_point(source, target, **kwargs)
+    if method == "rot":
+        return robot_refine(source, target, **kwargs)
+    raise ValueError(f"method must be 'icp' or 'rot', got {method!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -953,17 +1122,21 @@ def register_frames(
     n_downsample: Optional[int] = 5000,
     center_first: bool = False,
     output_root: Optional[str | Path] = None,
-    refine_with_ot: bool = False,
-    refine_with_robot: bool = False,
-    skip_icp: bool = False,
-    ot_max_rotation_deg: float = 5.0,
-    ot_kwargs: Optional[Dict[str, object]] = None,
-    robot_kwargs: Optional[Dict[str, object]] = None,
+    method: str = "icp",
+    rot_kwargs: Optional[Dict[str, object]] = None,
     coord_cols: Sequence[str] = COORD_COLS,
     verbose: bool = True,
     **icp_kwargs,
 ) -> RegistrationResult:
     """Register a dict of ``embryo_id -> nucleus table`` onto one reference.
+
+    One method, chosen by ``method``, produces the whole registration -- there
+    is no separate refinement stage layered on top. (An earlier version of this
+    function had one, ``refine_with_ot``/``ot_max_rotation_deg``/``ot_kwargs``,
+    wiring :func:`ot_refine` in after ICP; it has been removed in favour of
+    ``method="rot"`` below, which is a complete registration in its own right
+    rather than a bounded refinement of an ICP fit. :func:`ot_refine` itself is
+    unaffected and still available to call directly.)
 
     For a cohort whose embryos were oriented by hand, pass
     ``pca_init=False, inplane_only=True, max_rotation_deg=30``. See
@@ -972,14 +1145,24 @@ def register_frames(
     and an unconstrained fit will overwrite a correct manual orientation.
 
     Args:
-        n_downsample: isotropic downsample applied per embryo before ICP.  Set
-            ``None`` to register the full clouds (slower, rarely better -- ICP on
-            uniformly sampled clouds is both faster and less biased toward dense
-            regions).
-        refine_with_ot: after ICP, refine with soft optimal-transport
-            correspondences (:func:`ot_refine`).  Capped tightly by
-            ``ot_max_rotation_deg`` -- it is a refinement, not a second chance to
-            re-orient.
+        method: ``"icp"`` (default, unchanged) -- PCA coarse alignment plus
+            point-to-point ICP, via :func:`icp_point_to_point`, with
+            ``**icp_kwargs`` forwarded to it. ``"rot"`` -- iterated robust
+            optimal transport via :func:`robot_refine`, with ``rot_kwargs``
+            forwarded to it instead of ``**icp_kwargs``. See
+            :func:`register_points` for the equivalent single-pair call, and
+            :func:`robot_refine` for when it helps where ICP does not: unequal
+            nucleus counts, partial overlap, or a starting pose ICP's local
+            search cannot reach.
+        n_downsample: isotropic downsample applied per embryo before
+            registration.  Set ``None`` to register the full clouds (slower,
+            rarely better -- registering on uniformly sampled clouds is both
+            faster and less biased toward dense regions).
+        rot_kwargs: forwarded to :func:`robot_refine` when ``method="rot"``.
+            Unconstrained by default, unlike ICP; pass
+            ``rot_kwargs={"max_rotation_deg": ..., "inplane_only": True}`` to
+            hold it to a hand-set orientation the same way ``inplane_only`` /
+            ``max_rotation_deg`` in ``**icp_kwargs`` do for ``method="icp"``.
         coord_cols: which columns to register on.  The default ``("x", "y", "z")``
             mixes units -- xy in pixels, z in bin indices -- so with this project's
             geometry z contributes only about 1.5% of the cost and ICP effectively
@@ -987,23 +1170,15 @@ def register_frames(
             micrometres, where z is ~16%; that is also the only version in which a
             rotation matrix means a physical rotation rather than a shear.
         center_first: translate each cloud onto the reference centroid before
-            ICP.  Useful for atlas-to-atlas alignment where the two clouds may
-            sit in unrelated coordinate ranges.
-        refine_with_robot: run :func:`robot_refine` -- iterated robust OT -- after
-            ICP.  Unconstrained by default, unlike ``refine_with_ot``; pass
-            ``robot_kwargs={"max_rotation_deg": ..., "inplane_only": True}`` to
-            hold it to a hand-set orientation.
-        skip_icp: use the OT stage as the registration rather than as a refinement.
-            Only meaningful with ``refine_with_robot``; ICP is otherwise the only
-            thing producing a transform.
+            registration.  Useful for atlas-to-atlas alignment where the two
+            clouds may sit in unrelated coordinate ranges.
     """
     if not frames:
         return RegistrationResult(pd.DataFrame(), pd.DataFrame(), "", {})
-    if skip_icp and not refine_with_robot:
-        raise ValueError("skip_icp needs refine_with_robot; nothing would register")
+    if method not in ("icp", "rot"):
+        raise ValueError(f"method must be 'icp' or 'rot', got {method!r}")
 
-    ot_kwargs = dict(ot_kwargs or {})
-    robot_kwargs = dict(robot_kwargs or {})
+    rot_kwargs = dict(rot_kwargs or {})
     tables = {
         embryo_id: (
             isotropic_downsample(df, n_target=n_downsample, coord_cols=coord_cols)
@@ -1024,19 +1199,26 @@ def register_frames(
         )
 
     reference_cloud = tables[reference_embryo_id][list(coord_cols)].to_numpy(dtype=float)
-    # Report the backend actually used: a constrained fit goes to numpy even when
-    # open3d is installed, because open3d cannot honour the cap mid-fit.
-    constrained = (
-        icp_kwargs.get("max_rotation_deg") is not None
-        or icp_kwargs.get("inplane_only", False)
-    )
-    backend = "open3d" if (HAS_OPEN3D and not constrained) else "numpy"
     if verbose:
-        detail = " (constrained: capped in-plane rotation)" if constrained else ""
-        print(
-            f"  [ICP] point-to-point ({backend}){detail} -> reference "
-            f"{reference_embryo_id} ({len(reference_cloud):,} points)"
-        )
+        if method == "icp":
+            # Report the backend actually used: a constrained fit goes to numpy
+            # even when open3d is installed, because open3d cannot honour the
+            # cap mid-fit.
+            constrained = (
+                icp_kwargs.get("max_rotation_deg") is not None
+                or icp_kwargs.get("inplane_only", False)
+            )
+            backend = "open3d" if (HAS_OPEN3D and not constrained) else "numpy"
+            detail = " (constrained: capped in-plane rotation)" if constrained else ""
+            print(
+                f"  [ICP] point-to-point ({backend}){detail} -> reference "
+                f"{reference_embryo_id} ({len(reference_cloud):,} points)"
+            )
+        else:
+            print(
+                f"  [RobOT] robust optimal transport -> reference "
+                f"{reference_embryo_id} ({len(reference_cloud):,} points)"
+            )
 
     registered_frames: List[pd.DataFrame] = []
     transforms: Dict[str, np.ndarray] = {}
@@ -1053,41 +1235,21 @@ def register_frames(
             offset = np.zeros(3)
             if center_first:
                 offset = reference_cloud.mean(axis=0) - cloud.mean(axis=0)
-            if skip_icp:
-                transformed, transform = cloud + offset, np.eye(4)
-                transform[:3, 3] = offset
+
+            if method == "rot":
+                # robot_refine prints its own per-iteration and summary lines
+                # when verbose; no extra banner needed here.
+                transformed, transform = register_points(
+                    cloud + offset, reference_cloud, method="rot",
+                    verbose=verbose, **rot_kwargs,
+                )
             else:
-                transformed, transform = icp_point_to_point(
-                    cloud + offset, reference_cloud, **icp_kwargs
+                transformed, transform = register_points(
+                    cloud + offset, reference_cloud, method="icp", **icp_kwargs,
                 )
-                shift = np.eye(4)
-                shift[:3, 3] = offset
-                transform = transform @ shift
-
-            if refine_with_ot:
-                if verbose:
-                    print(f"    {embryo_id}: OT refinement")
-                # setdefault, not a keyword: passing both here and splatting
-                # ot_kwargs raised "got multiple values for keyword argument"
-                # whenever a caller tried to override either of them, which made
-                # the documented way of unconstraining this stage unusable.
-                ot_kwargs.setdefault("max_rotation_deg", ot_max_rotation_deg)
-                ot_kwargs.setdefault(
-                    "inplane_only", icp_kwargs.get("inplane_only", False)
-                )
-                transformed, extra = ot_refine(
-                    transformed, reference_cloud,
-                    verbose=verbose, **ot_kwargs,
-                )
-                transform = extra @ transform
-
-            if refine_with_robot:
-                if verbose:
-                    print(f"    {embryo_id}: RobOT")
-                transformed, extra = robot_refine(
-                    transformed, reference_cloud, verbose=verbose, **robot_kwargs,
-                )
-                transform = extra @ transform
+            shift = np.eye(4)
+            shift[:3, 3] = offset
+            transform = transform @ shift
 
         out = df.copy()
         out[["x_reg", "y_reg", "z_reg"]] = transformed
@@ -1140,7 +1302,10 @@ def register_cohort(
     """Register a list of :class:`~register_embryos.assignment.EmbryoResult`.
 
     Accepts either those objects or a single combined nucleus table with an
-    ``embryo_id`` column.
+    ``embryo_id`` column. ``**icp_kwargs`` is forwarded to
+    :func:`register_frames`, so ``method="rot"`` and ``rot_kwargs=...`` (or any
+    other :func:`register_frames` keyword) work here exactly the same way --
+    see that function for the full ``method="icp"``/``"rot"`` contract.
     """
     if isinstance(results, pd.DataFrame):
         frames = {
