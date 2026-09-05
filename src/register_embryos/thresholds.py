@@ -49,6 +49,7 @@ __all__ = [
     "threshold_sweep",
     "plot_threshold_diagnostics",
     "as_frames",
+    "resolve_source_frame",
     "resolve_gene_cuts",
     "positive_calls",
     "positive_fraction",
@@ -475,8 +476,12 @@ def as_frames(source, label: Optional[str] = None) -> List[Tuple[str, pd.DataFra
     ``embryo_id`` while an atlas is a single composite.
 
     Accepts an :class:`~register_embryos.atlas.Atlas` (duck-typed on ``.points``), a
-    dataframe (split by ``embryo_id`` when it holds more than one), a
-    ``{label: frame}`` mapping, or an explicit ``[(label, frame), ...]`` list.
+    :class:`~register_embryos.workflow.CohortWorkflow` (duck-typed on ``.atlas`` /
+    ``.registration`` / ``.combined``, preferring the atlas, then the registered
+    cohort, then the raw combined table -- progressively less processed views of
+    the same nuclei), a dataframe (split by ``embryo_id`` when it holds more than
+    one), a ``{label: frame}`` mapping, or an explicit ``[(label, frame), ...]``
+    list.
     """
     points = getattr(source, "points", None)
     if isinstance(points, pd.DataFrame):
@@ -492,7 +497,51 @@ def as_frames(source, label: Optional[str] = None) -> List[Tuple[str, pd.DataFra
         return [(label or "", source)]
     if isinstance(source, dict):
         return [(str(k), v) for k, v in source.items()]
+    atlas = getattr(source, "atlas", None)
+    if atlas is not None:
+        return as_frames(atlas, label=label)
+    registration = getattr(source, "registration", None)
+    registered = getattr(registration, "registered", None)
+    if isinstance(registered, pd.DataFrame) and not registered.empty:
+        return as_frames(registered, label=label)
+    combined = getattr(source, "combined", None)
+    if isinstance(combined, pd.DataFrame):
+        return as_frames(combined, label=label)
     return [(str(k), v) for k, v in source]
+
+
+def resolve_source_frame(source, label: Optional[str] = None) -> Tuple[pd.DataFrame, str]:
+    """Normalise a dataframe, an :class:`Atlas`, or a ``CohortWorkflow`` to one frame.
+
+    Unlike :func:`as_frames`, this never splits a multi-embryo table into
+    per-embryo rows -- it is for callers that want a single pooled/composite
+    table, atlas or registered cohort alike (one panel-per-gene figure, one 3D
+    scatter). For a ``CohortWorkflow`` (conventionally named ``wf``), prefers
+    ``wf.atlas.points``, falling back to the registered cohort, then the raw
+    combined table.
+
+    Returns ``(frame, label_hint)``, where ``label_hint`` is the atlas's label,
+    ``""`` for a bare dataframe, or a description of which fallback was used.
+    """
+    if isinstance(source, pd.DataFrame):
+        return source, label or ""
+    points = getattr(source, "points", None)
+    if isinstance(points, pd.DataFrame):
+        return points, label or str(getattr(source, "label", "atlas"))
+    atlas = getattr(source, "atlas", None)
+    if atlas is not None:
+        return resolve_source_frame(atlas, label=label)
+    registration = getattr(source, "registration", None)
+    registered = getattr(registration, "registered", None)
+    if isinstance(registered, pd.DataFrame) and not registered.empty:
+        return registered, label or "registered cohort"
+    combined = getattr(source, "combined", None)
+    if isinstance(combined, pd.DataFrame):
+        return combined, label or "combined"
+    raise TypeError(
+        f"expected a DataFrame, an Atlas, or a CohortWorkflow (with .atlas, "
+        f".registration or .combined) -- got {type(source).__name__}"
+    )
 
 
 def resolve_gene_cuts(

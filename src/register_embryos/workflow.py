@@ -865,7 +865,7 @@ class CohortWorkflow:
                 if len(self.registration.embryo_ids) > 1:
                     path = figure_dir / f"registration_qc_{mode}.png"
                     plot_registration_2d(
-                        registered, self.registration.reference_embryo_id, mode=mode,
+                        self, mode=mode,
                         suptitle=f"{self.cohort.name} — ICP QC", save_path=path,
                     )
                     written.append(path)
@@ -889,15 +889,15 @@ class CohortWorkflow:
                 written.append(path)
 
             if self.atlas is not None:
-                points = self.atlas.points
+                n_atlas_points = len(self.atlas.points)
                 for name, plotter, kwargs in (
                     ("atlas_additive_2d", plot_additive_2d, {}),
                     ("atlas_per_gene_2d", plot_gene_panels_2d, {}),
                 ):
                     path = figure_dir / f"{name}_{mode}.png"
                     plotter(
-                        points, mode=mode, save_path=path,
-                        suptitle=f"{self.cohort.name} atlas ({len(points):,} points)",
+                        self.atlas, mode=mode, save_path=path,
+                        suptitle=f"{self.cohort.name} atlas ({n_atlas_points:,} points)",
                         coords=("x", "y", "z"), **kwargs,
                     )
                     written.append(path)
@@ -917,7 +917,7 @@ class CohortWorkflow:
                 ):
                     path = figure_dir / f"{name}_{mode}.html"
                     plotter(
-                        points, mode=mode, save_path=path,
+                        self.atlas, mode=mode, save_path=path,
                         title=f"{self.cohort.name} atlas", coords=("x", "y", "z"),
                     )
                     written.append(path)

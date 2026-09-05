@@ -400,7 +400,7 @@ def _write_html(fig, save_path: Optional[str | Path]) -> Optional[Path]:
 
 
 def plot_pointcloud_3d(
-    df: pd.DataFrame,
+    source,
     genes: Optional[Sequence[str]] = None,
     mode: str = "dark",
     coords: Optional[Sequence[str]] = None,
@@ -416,11 +416,19 @@ def plot_pointcloud_3d(
     The colour ramp runs from the theme's ground to the gene hue and is capped at
     the gene's ``quantile_cap`` quantile, so one saturated nucleus does not
     compress the whole scale.
+
+    Args:
+        source: a dataframe, an :class:`~register_embryos.atlas.Atlas`, or a
+            :class:`~register_embryos.workflow.CohortWorkflow` (``wf``) -- see
+            :func:`~register_embryos.thresholds.resolve_source_frame` for how a
+            ``wf`` resolves to one pooled table.
     """
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
+    from .thresholds import resolve_source_frame
 
     theme = theme_for(mode)
+    df, _ = resolve_source_frame(source)
     coord_cols = _resolve_coords(df, coords)
     gene_list = _resolve_genes(df, genes)
     if not gene_list:
@@ -477,7 +485,7 @@ def plot_pointcloud_3d(
 
 
 def plot_additive_3d(
-    df: pd.DataFrame,
+    source,
     genes: Optional[Sequence[str]] = None,
     mode: str = "dark",
     coords: Optional[Sequence[str]] = None,
@@ -492,10 +500,18 @@ def plot_additive_3d(
 
     Silent nuclei are drawn first and faint so they give the embryo a shape
     without occluding expressing nuclei, which are drawn opaque on top.
+
+    Args:
+        source: a dataframe, an :class:`~register_embryos.atlas.Atlas`, or a
+            :class:`~register_embryos.workflow.CohortWorkflow` (``wf``) -- see
+            :func:`~register_embryos.thresholds.resolve_source_frame` for how a
+            ``wf`` resolves to one pooled table.
     """
     import plotly.graph_objects as go
+    from .thresholds import resolve_source_frame
 
     theme = theme_for(mode)
+    df, _ = resolve_source_frame(source)
     coord_cols = _resolve_coords(df, coords)
     st = style or additive_style(df, genes, mode=mode, **style_kwargs)
     gene_list = st["genes"]
@@ -558,6 +574,15 @@ PROJECTIONS = (("x", "y", "XY"), ("x", "z", "XZ"), ("y", "z", "YZ"))
 def _projection_cols(coord_cols: Sequence[str]) -> List[Tuple[str, str, str]]:
     x, y, z = coord_cols
     return [(x, y, "XY"), (x, z, "XZ"), (y, z, "YZ")]
+
+
+def _projection_pair(coord_cols: Sequence[str], projection: str) -> Tuple[str, str]:
+    """``"XY"``/``"XZ"``/``"YZ"`` -> the matching pair of columns in ``coord_cols``."""
+    wanted = str(projection).upper()
+    for cx, cy, label in _projection_cols(coord_cols):
+        if label == wanted:
+            return cx, cy
+    raise ValueError(f"unknown projection {projection!r} (expected 'XY', 'XZ', or 'YZ')")
 
 
 XY_AXES = frozenset({"x", "y", "x_reg", "y_reg", "x_um", "y_um"})
@@ -631,7 +656,7 @@ def _save_fig(fig, theme: Theme, save_path: Optional[str | Path]) -> Optional[Pa
 
 
 def plot_additive_2d(
-    frames,
+    source,
     coord_sets: Optional[Sequence[Tuple[str, str, str]]] = None,
     style_of=None,
     mode: str = "dark",
@@ -650,11 +675,15 @@ def plot_additive_2d(
     n_cols: Optional[int] = None,
     **style_kwargs,
 ):
-    """Additive-overlay projections, one row per entry in ``frames``.
+    """Additive-overlay projections, one row per entry in ``source``.
 
     Args:
-        frames: a dataframe, or ``[(row_label, dataframe), ...]`` for one row each --
-            the shape to use for stacking per-embryo rows or comparing atlases.
+        source: a dataframe, an :class:`~register_embryos.atlas.Atlas`, a
+            :class:`~register_embryos.workflow.CohortWorkflow` (``wf``, resolved to
+            one pooled table -- see
+            :func:`~register_embryos.thresholds.resolve_source_frame`), or
+            ``[(row_label, dataframe), ...]`` for one row each -- the shape to use
+            for stacking per-embryo rows or comparing atlases.
         coord_sets: ``[(cx, cy, panel_label), ...]`` column triples. Defaults to the
             XY/XZ/YZ projections of whichever coordinate set is present.
         style_of: precomputed :func:`additive_style` output -- a dict keyed by row
@@ -688,14 +717,18 @@ def plot_additive_2d(
     theme = theme_for(mode)
     dark = theme.is_dark
 
-    # Accept a bare dataframe (+ a bare style dict) for the single-atlas case.
-    if isinstance(frames, pd.DataFrame):
-        frames = [("", frames)]
+    # Accept a bare dataframe, Atlas, or CohortWorkflow (+ a bare style dict) for
+    # the single-atlas case -- resolved to one frame, never split into rows.
+    if not isinstance(source, (list, tuple, dict)):
+        if not isinstance(source, pd.DataFrame):
+            from .thresholds import resolve_source_frame
+            source, _ = resolve_source_frame(source)
+        source = [("", source)]
         if style_of is not None and not isinstance(style_of, dict):
             style_of = {"": style_of}
         elif isinstance(style_of, dict) and "rgb" in style_of:
             style_of = {"": style_of}
-    frame_list = list(frames)
+    frame_list = list(source)
 
     first = frame_list[0][1]
     if coord_sets is None:
@@ -946,11 +979,11 @@ def plot_additive_gene_2d(
 
 
 def plot_gene_panels_2d(
-    df: pd.DataFrame,
+    source,
     genes: Optional[Sequence[str]] = None,
     mode: str = "dark",
     coords: Optional[Sequence[str]] = None,
-    projection: Tuple[int, int] = (0, 1),
+    projection: str = "XY",
     suptitle: str = "",
     threshold: float = INTENSITY_THRESH,
     drop_unmeasured: bool = True,
@@ -963,6 +996,11 @@ def plot_gene_panels_2d(
     Works on a single embryo, a pooled registered cohort, or an atlas.
 
     Args:
+        source: a dataframe, an :class:`~register_embryos.atlas.Atlas`, or a
+            :class:`~register_embryos.workflow.CohortWorkflow` (``wf``) -- see
+            :func:`~register_embryos.thresholds.resolve_source_frame` for how a
+            ``wf`` resolves to one pooled table.
+        projection: one of ``"XY"``, ``"XZ"``, ``"YZ"``.
         drop_unmeasured: leave out nuclei whose value for that gene is NaN, rather
             than drawing them grey. NaN means "not measured here" -- an embryo whose
             panel never carried this gene, or an atlas point with no measuring
@@ -974,11 +1012,13 @@ def plot_gene_panels_2d(
     import matplotlib
     import matplotlib.pyplot as plt
     from matplotlib.colors import LinearSegmentedColormap
+    from .thresholds import resolve_source_frame
 
     matplotlib.rcParams["pdf.fonttype"] = 42
     theme = theme_for(mode)
+    df, _ = resolve_source_frame(source)
     coord_cols = _resolve_coords(df, coords)
-    cx, cy = coord_cols[projection[0]], coord_cols[projection[1]]
+    cx, cy = _projection_pair(coord_cols, projection)
     gene_list = _resolve_genes(df, genes)
 
     fig, axes = plt.subplots(
@@ -1025,11 +1065,11 @@ def plot_gene_panels_2d(
 
 
 def plot_gene_by_embryo(
-    registered: pd.DataFrame,
+    source,
     genes: Optional[Sequence[str]] = None,
     mode: str = "light",
     coords: Optional[Sequence[str]] = None,
-    projection: Tuple[int, int] = (0, 1),
+    projection: str = "XY",
     threshold=INTENSITY_THRESH,
     suptitle: str = "",
     panel_size: float = 2.9,
@@ -1051,6 +1091,10 @@ def plot_gene_by_embryo(
     do whenever a rotating-partner design is used).
 
     Args:
+        source: a registered nucleus table (one or more ``embryo_id`` rows), or a
+            :class:`~register_embryos.workflow.CohortWorkflow` (``wf``), resolved
+            via :func:`~register_embryos.thresholds.resolve_source_frame`.
+        projection: one of ``"XY"``, ``"XZ"``, ``"YZ"``.
         threshold: a scalar, or a ``{gene: cut}`` mapping, or the ``results`` dict
             from :func:`~register_embryos.thresholds.call_thresholds` (per-embryo cuts
             are then used for the matching embryo).
@@ -1061,11 +1105,13 @@ def plot_gene_by_embryo(
     import matplotlib
     import matplotlib.pyplot as plt
     from matplotlib.colors import LinearSegmentedColormap
+    from .thresholds import resolve_source_frame
 
     matplotlib.rcParams["pdf.fonttype"] = 42
     theme = theme_for(mode)
+    registered, _ = resolve_source_frame(source)
     coord_cols = _resolve_coords(registered, coords)
-    cx, cy = coord_cols[projection[0]], coord_cols[projection[1]]
+    cx, cy = _projection_pair(coord_cols, projection)
     gene_list = _resolve_genes(registered, genes)
     embryos = list(registered["embryo_id"].unique())
 
@@ -1149,9 +1195,39 @@ def plot_gene_by_embryo(
     return fig
 
 
+def _resolve_registration_source(
+    source, reference_embryo_id: Optional[str]
+) -> Tuple[pd.DataFrame, str]:
+    """Duck-type ``source`` into ``(registered, reference_embryo_id)``.
+
+    Accepts a plain registered dataframe (paired with an explicit
+    ``reference_embryo_id``), a :class:`~register_embryos.registration.RegistrationResult`,
+    or a :class:`~register_embryos.workflow.CohortWorkflow` (``wf``, via
+    ``wf.registration``) -- the latter two already know their own reference embryo,
+    so ``reference_embryo_id`` is only needed to override it.
+    """
+    if isinstance(source, pd.DataFrame):
+        registered, resolved_ref = source, reference_embryo_id
+    else:
+        registration = getattr(source, "registration", source)
+        registered = getattr(registration, "registered", None)
+        if not isinstance(registered, pd.DataFrame):
+            raise TypeError(
+                f"expected a registered DataFrame, a RegistrationResult, or a "
+                f"CohortWorkflow -- got {type(source).__name__}"
+            )
+        resolved_ref = reference_embryo_id or getattr(registration, "reference_embryo_id", None)
+    if resolved_ref is None:
+        raise ValueError(
+            "reference_embryo_id is required when source has no registration result "
+            "to read it from"
+        )
+    return registered, resolved_ref
+
+
 def plot_registration_2d(
-    registered: pd.DataFrame,
-    reference_embryo_id: str,
+    source,
+    reference_embryo_id: Optional[str] = None,
     mode: str = "light",
     embryo_ids: Optional[Iterable[str]] = None,
     suptitle: str = "",
@@ -1166,10 +1242,18 @@ def plot_registration_2d(
     Six panels per embryo -- XY/XZ/YZ raw, then XY/XZ/YZ registered.  This is the
     plot that tells you whether a fit actually worked; a residual number alone
     will not reveal an embryo that converged to a plausible-looking wrong pose.
+
+    Args:
+        source: a registered nucleus table, a
+            :class:`~register_embryos.registration.RegistrationResult`, or a
+            :class:`~register_embryos.workflow.CohortWorkflow` (``wf``).
+        reference_embryo_id: required for a plain dataframe; otherwise defaults to
+            ``source``'s own reference embryo.
     """
     import matplotlib.pyplot as plt
 
     theme = theme_for(mode)
+    registered, reference_embryo_id = _resolve_registration_source(source, reference_embryo_id)
     ids = list(embryo_ids) if embryo_ids is not None else [
         e for e in registered["embryo_id"].unique() if e != reference_embryo_id
     ]
